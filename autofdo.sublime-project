@@ -1,0 +1,17 @@
+{
+	"folders":
+	[
+		{
+			"path": ".",
+      "folder_exclude_patterns": ["autom4te.cache"]
+		}
+	],
+	"build_systems":
+	[
+		{
+			"name": "autofdo - all",
+			"cmd": ["/usr/bin/make", "-f", "Makefile", "VERBOSE=1", "all"],
+			"working_dir": "~/Build/autofdo.bld"
+		}
+  ]
+}
