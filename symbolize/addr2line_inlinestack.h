@@ -123,7 +123,7 @@ class SubprogramInfo {
   // destroyed before we're done, so we need to make a copy.
   string name_;
   AddressRangeList::RangeList address_ranges_;
-  bool inlined_;
+  const bool inlined_;
   const char *comp_directory_;  // working dir of compilation.
   const char *callsite_directory_;
   const char *callsite_filename_;

@@ -28,6 +28,7 @@
 
 DEFINE_bool(use_lbr, true,
             "Whether to use lbr profile.");
+DECLARE_bool(use_column);
 
 namespace autofdo {
 Profile::ProfileMaps *Profile::GetProfileMaps(uint64 addr) {
@@ -140,7 +141,8 @@ void Profile::ProcessPerFunctionProfile(string func_name,
     }
     if (info->source_stack.size() > 0) {
       symbol_map_->AddSourceCount(func_name, info->source_stack,
-                                  address_count.second, 0, SymbolMap::MAX);
+                                  address_count.second, 0,
+                            FLAGS_use_column? SymbolMap::SUM : SymbolMap::MAX);
     }
   }
 

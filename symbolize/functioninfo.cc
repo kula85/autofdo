@@ -30,6 +30,10 @@
 #include "base/common.h"
 #include "symbolize/dwarf2enums.h"
 
+
+DEFINE_bool(use_column, false, "use line:col instead of line:discriminator to "
+            "uniquely identify a instruction");
+
 namespace autofdo {
 
 CULineInfoHandler::CULineInfoHandler(FileVector* files,
@@ -103,7 +107,8 @@ void CULineInfoHandler::AddLine(uint64 address, uint32 file_num,
     if (file.first < dirs_->size()) {
       DirectoryFilePair file_and_dir = make_pair((*dirs_)[file.first],
                                                  file.second);
-      LineIdentifier line_id(file_and_dir, line_num, discriminator);
+        LineIdentifier line_id(file_and_dir, line_num,
+                               FLAGS_use_column? column_num : discriminator);
       (*linemap_)[address] = line_id;
     } else {
       LOG(INFO) << "error in AddLine (bad dir_num " << file.first << ")";
