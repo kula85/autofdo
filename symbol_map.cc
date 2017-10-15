@@ -653,6 +653,82 @@ std::map<uint64, uint64> SymbolMap::GetSampledSymbolStartAddressSizeMap(
   return ret;
 }
 
+typedef llvm::sampleprof::SourceStack SourceStack2;
+typedef llvm::sampleprof::SourceInfo SourceInfo2;
+
+static const SourceStack2 GetInlineStack(CallFrame CF,
+                                         const Addr2line *addr2line,
+                                         const string &file_base_name,
+                                         const uint64 base_addr) {
+  SourceStack2 source_stack;
+
+  const string &DSOName = CF.first;
+  const uint64 Offset = CF.second;
+  if (file_base_name == basename(DSOName.c_str())) { // focused binary
+    SourceStack iss;
+    addr2line->GetInlineStack(base_addr + Offset, &iss);
+
+    for (auto &S : iss) {
+      const string func_name = S.func_name ? S.func_name : "null";
+      const string dir_name = S.dir_name ? S.dir_name : "null";
+      const string file_name = S.file_name ? S.file_name : "null";
+      source_stack.push_back(SourceInfo2(func_name, dir_name, file_name,
+                                         S.start_line, S.line, S.discriminator));
+    }
+
+    //SourceStack2 inline_source_stack;
+    //source_stack.insert(source_stack.end(), inline_source_stack.begin(),
+    //                                        inline_source_stack.end());
+  } else { // other binary
+    // TODO: correct this using addr2line for shared library also.
+    const char *DN = DSOName.c_str();
+    const uint32 max32 = numeric_limits<uint32_t>::max();
+    source_stack.push_back(SourceInfo2(DN, DN, DN, max32, max32, max32));
+  }
+
+  return source_stack;
+}
+
+void SymbolMap::ComputeCallChain(const Addr2line *addr2line,
+                                 const CallChainCountMap &CCM) {
+  const string &file_base_name = basename(binary_.c_str());
+
+  for (const auto &it : CCM) {
+    SourceStack2 source_stack;
+
+    for (const auto &Frame : it.first) {
+      const SourceStack2 &SS = GetInlineStack(Frame, addr2line, file_base_name, base_addr_);
+      source_stack.insert(source_stack.end(), SS.begin(), SS.end());
+      // const string &DSOName = Frame.first;
+      // const uint64 Offset = Frame.second;
+
+      // if (basename(DSOName) == file_base_name) { // focused binary
+      //   SourceStack inline_source_stack;
+      //   addr2line_->GetInlineStack(base_addr_ + Offset, &source_stack);
+      //   source_stack.insert(source_stack.end(), inline_source_stack.begin(),
+      //                                           inline_source_stack.end());
+      // } else { // other binary
+      //   // TODO: correct this using addr2line for shared library also.
+      //   const char *DN = DSOName.c_str();
+      //   const uint32 max32 = numeric_limits<uint32_t>::max();
+      //   source_stack.push_back(SourceInfo(DN, DN, DN, max32, max32, max32));
+      // }
+    }
+
+    for (const auto &S : it.second) {
+      const SourceStack2 &SS = GetInlineStack(S, addr2line, file_base_name, base_addr_);
+      if (SS.size() > 1) {
+        SourceStack2 TSS = source_stack;
+        TSS.insert(TSS.end(), SS.begin()+1, SS.end());
+        call_chain_count_map_[TSS].push_back(SS[0]);
+      } else if (SS.size() == 1) {
+        call_chain_count_map_[source_stack].push_back(SS[0]);
+      } else
+        assert(0);
+    }
+  }
+}
+
 // SymbolMap has already be read from old profile. This function traverses
 // symbol map to calculated the functions that have samples.
 std::map<uint64, uint64> SymbolMap::GetLegacySymbolStartAddressSizeMap() const {

@@ -34,6 +34,8 @@
 
 DEFINE_bool(debug_dump, false,
             "If set, emit additional debugging dumps to stderr.");
+DEFINE_bool(generate_callchain_profile, false,
+            "If set, generate callchain profile.");
 
 namespace autofdo {
 // Opens the output file, and writes the header.

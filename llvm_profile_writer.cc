@@ -31,6 +31,7 @@
 #include "profile_writer.h"
 
 DECLARE_bool(debug_dump);
+DECLARE_bool(generate_callchain_profile);
 
 namespace autofdo {
 
@@ -150,6 +151,11 @@ llvm::StringRef LLVMProfileBuilder::GetNameRef(const string &str) {
 
 bool LLVMProfileWriter::WriteToFile(const string &output_filename) {
   if (FLAGS_debug_dump) Dump();
+
+  if (FLAGS_generate_callchain_profile) {
+    llvm::WriteCallChainMap(symbol_map_->callchain_map(), output_filename);
+    return true;
+  }
 
   // Populate the symbol table. This table contains all the symbols
   // for functions found in the binary.

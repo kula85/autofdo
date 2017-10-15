@@ -183,6 +183,7 @@ void Profile::ComputeProfile() {
   }
   symbol_map_->Merge();
   symbol_map_->ComputeWorkingSets();
+  symbol_map_->ComputeCallChain(addr2line_, sample_reader_->callchain_count_map());
 }
 
 Profile::~Profile() {

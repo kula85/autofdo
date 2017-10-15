@@ -39,6 +39,11 @@ typedef map<Range, uint64> RangeCountMap;
 typedef pair<uint64, uint64> Branch;
 typedef map<Branch, uint64> BranchCountMap;
 
+// DSOName + offset
+typedef pair<string, uint64> CallFrame;
+typedef vector<CallFrame> CallChain;
+typedef map<CallChain, set<CallFrame>> CallChainCountMap;
+
 // Reads in the profile data, and represent it in address_count_map_.
 class SampleReader {
  public:
@@ -59,6 +64,10 @@ class SampleReader {
     return branch_count_map_;
   }
 
+  const CallChainCountMap &callchain_count_map() const {
+    return callchain_count_map_;
+  }
+
   set<uint64> GetSampledAddresses() const;
 
   // Returns the sample count for a given instruction.
@@ -74,6 +83,7 @@ class SampleReader {
     address_count_map_.clear();
     range_count_map_.clear();
     branch_count_map_.clear();
+    callchain_count_map_.clear();
   }
 
  protected:
@@ -84,6 +94,7 @@ class SampleReader {
   AddressCountMap address_count_map_;
   RangeCountMap range_count_map_;
   BranchCountMap branch_count_map_;
+  CallChainCountMap callchain_count_map_;
 };
 
 // Base class that reads in the profile from a sample data file.

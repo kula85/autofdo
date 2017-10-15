@@ -28,6 +28,8 @@
 #include "base/common.h"
 #include "base/macros.h"
 #include "source_info.h"
+#include "sample_reader.h"
+#include "llvm/ProfileData/SourceInfo.h"
 
 // Macros from gcc (profile.c)
 #define NUM_GCOV_WORKING_SETS 128
@@ -164,6 +166,8 @@ typedef std::map<string, uint64> NameAddressMap;
 // Maps function name to alias names.
 typedef map<string, set<string> > NameAliasMap;
 
+//typedef map<SourceStack, set<SourceInfo>> CallChainMap;
+
 // SymbolMap stores the symbols in the binary, and maintains
 // a map from symbol name to its related information.
 class SymbolMap {
@@ -224,6 +228,10 @@ class SymbolMap {
 
   NameSymbolMap &map() {
     return map_;
+  }
+
+  const llvm::sampleprof::CallChainMap &callchain_map() const {
+    return call_chain_count_map_;
   }
 
   const gcov_working_set_info *GetWorkingSets() const {
@@ -347,6 +355,8 @@ class SymbolMap {
   // Validates if the current symbol map is sane.
   bool Validate() const;
 
+  void ComputeCallChain(const Addr2line *addr2line, const CallChainCountMap &);
+
  private:
   // Reads from the binary's elf section to build the symbol map.
   void BuildSymbolMap();
@@ -366,6 +376,8 @@ class SymbolMap {
   uint64 base_addr_;
   int64 count_threshold_;
   bool use_discriminator_encoding_;
+  llvm::sampleprof::CallChainMap call_chain_count_map_;
+
   /* working_set_[i] stores # of instructions that consumes
      i/NUM_GCOV_WORKING_SETS of total instruction counts.  */
   gcov_working_set_info working_set_[NUM_GCOV_WORKING_SETS];
