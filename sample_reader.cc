@@ -22,6 +22,8 @@
 #include "base/logging.h"
 #include "chromiumos-wide-profiling/perf_parser.h"
 
+DECLARE_bool(generate_callchain_profile);
+
 namespace {
 // Returns true if name equals full_name, or full_name is empty and name
 // matches re.
@@ -242,12 +244,14 @@ bool PerfDataSampleReader::Append(const string &profile_file) {
       }
     }
 
-    CallChain CC;
-    for (unsigned i = 0; i < event.callchain.size(); i++)
-      CC.push_back(std::make_pair(event.callchain[i].dso_name(),
-                                  event.callchain[i].offset()));
-    callchain_count_map_[CC].insert(std::make_pair(event.dso_and_offset.dso_name(),
-                                                   event.dso_and_offset.offset()));
+    if (FLAGS_generate_callchain_profile) {
+      CallChain CC;
+      for (unsigned i = 0; i < event.callchain.size(); i++)
+        CC.push_back(std::make_pair(event.callchain[i].dso_name(),
+                                    event.callchain[i].offset()));
+      callchain_count_map_[CC].insert(std::make_pair(event.dso_and_offset.dso_name(),
+                                                     event.dso_and_offset.offset()));
+    }
   }
   return true;
 }

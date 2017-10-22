@@ -28,6 +28,7 @@
 
 DEFINE_bool(use_lbr, true,
             "Whether to use lbr profile.");
+DECLARE_bool(generate_callchain_profile);
 
 namespace autofdo {
 Profile::ProfileMaps *Profile::GetProfileMaps(uint64 addr) {
@@ -183,7 +184,8 @@ void Profile::ComputeProfile() {
   }
   symbol_map_->Merge();
   symbol_map_->ComputeWorkingSets();
-  symbol_map_->ComputeCallChain(addr2line_, sample_reader_->callchain_count_map());
+  if (FLAGS_generate_callchain_profile)
+    symbol_map_->ComputeCallChain(addr2line_, sample_reader_->callchain_count_map());
 }
 
 Profile::~Profile() {
