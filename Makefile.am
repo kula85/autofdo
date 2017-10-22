@@ -2,7 +2,8 @@
 
 ACLOCAL_AMFLAGS = -I m4
 AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src
-AM_CXXFLAGS = -std=gnu++11
+AM_CXXFLAGS = -std=gnu++11 $(LLVM_CXXFLAGS)
+AM_LDFLAGS = $(LLVM_LDFLAGS)
 
 COMMON_PROFILE_CREATOR_FILES = addr2line.cc gcov.cc instruction_map.cc \
                                module_grouper.cc profile_creator.cc \
@@ -41,9 +42,8 @@ profile_update_LDADD = libquipper.a libglog.a libsymbolize.a libgflags.a
 bin_PROGRAMS += create_llvm_prof
 create_llvm_prof_SOURCES = $(COMMON_PROFILE_CREATOR_FILES) \
                            llvm_profile_writer.cc create_llvm_prof.cc
-create_llvm_prof_LDADD = $(LLVM_LDFLAGS) libquipper.a libglog.a libsymbolize.a \
+create_llvm_prof_LDADD = libquipper.a libglog.a libsymbolize.a \
                          libgflags.a
-create_llvm_prof_CXXFLAGS = $(LLVM_CXXFLAGS)
 
 noinst_LIBRARIES = libquipper.a
 libquipper_a_SOURCES = chromiumos-wide-profiling/address_mapper.cc chromiumos-wide-profiling/perf_reader.cc \
