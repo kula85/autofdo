@@ -1,7 +1,7 @@
 ## Process this file with automake to produce Makefile.in
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src -I$(top_srcdir)/chromiumos-wide-profiling/compat/ext -I/home/qe/Install/generic/protobuf/include -I/home/qe/Install/generic/llvm5/include
+AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src -I$(top_srcdir)/chromiumos-wide-profiling -I$(top_srcdir)/chromiumos-wide-profiling/compat/ext -I/home/qe/Install/generic/protobuf/include -I/home/qe/Install/generic/llvm5/include
 AM_CXXFLAGS = -g -std=gnu++11
 AM_LDFLAGS = $(LLVM_LDFLAGS) -L/home/qe/Install/generic/googletest/lib -lgtest -L/home/qe/Install/generic/protobuf/lib -lprotobuf -pthread -lpthread -lelf
 

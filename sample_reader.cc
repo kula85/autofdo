@@ -229,7 +229,6 @@ bool PerfDataSampleReader::Append(const string &profile_file) {
       continue;
     }
 
-    std::cout << event.dso_and_offset.dso_name() << std::endl;
     if (MatchBinary(event.dso_and_offset.dso_name(), focus_binary)) {
       address_count_map_[event.dso_and_offset.offset()]++;
     }
