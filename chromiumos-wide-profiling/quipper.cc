@@ -7,10 +7,9 @@
 
 #include "base/logging.h"
 
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/perf_protobuf_io.h"
-#include "chromiumos-wide-profiling/perf_reader.h"
-#include "chromiumos-wide-profiling/perf_recorder.h"
+#include "compat/string.h"
+#include "file_utils.h"
+#include "perf_recorder.h"
 
 namespace {
 
@@ -18,7 +17,7 @@ const char kDefaultOutputFile[] = "/dev/stdout";
 
 int StringToInt(const string& s) {
   int r;
-  stringstream ss;
+  std::stringstream ss;
   ss << s;
   ss >> r;
   return r;
@@ -56,12 +55,15 @@ int main(int argc, char* argv[]) {
     return 1;
 
   quipper::PerfRecorder perf_recorder;
-  quipper::PerfDataProto perf_data_proto;
-  if (!perf_recorder.RecordAndConvertToProtobuf(perf_args,
-                                                perf_duration,
-                                                &perf_data_proto))
+  string output_string;
+  if (!perf_recorder.RunCommandAndGetSerializedOutput(perf_args,
+                                                      perf_duration,
+                                                      &output_string)) {
     return 1;
-  if (!WriteProtobufToFile(perf_data_proto, kDefaultOutputFile))
+  }
+
+  if (!quipper::BufferToFile(kDefaultOutputFile, output_string))
     return 1;
+
   return 0;
 }

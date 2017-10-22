@@ -5,7 +5,7 @@
 #ifndef CHROMIUMOS_WIDE_PROFILING_BUFFER_WRITER_H_
 #define CHROMIUMOS_WIDE_PROFILING_BUFFER_WRITER_H_
 
-#include "chromiumos-wide-profiling/data_writer.h"
+#include "data_writer.h"
 
 namespace quipper {
 
@@ -32,6 +32,8 @@ class BufferWriter : public DataWriter {
   bool WriteString(const string& str, const size_t size) override;
 
  private:
+  bool CanWriteSize(size_t data_size) override;
+
   // Pointer to the data buffer. Does not own the buffer.
   char* buffer_;
 

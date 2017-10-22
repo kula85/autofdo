@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// TODO(asharif): Move this and other utilities to contrib/ dir.
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -11,8 +10,9 @@
 
 #include "base/logging.h"
 
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/conversion_utils.h"
+#include "compat/log_level.h"
+#include "compat/string.h"
+#include "conversion_utils.h"
 
 using quipper::FormatAndFile;
 using quipper::kPerfFormat;
@@ -39,8 +39,9 @@ bool ParseArguments(int argc, char* argv[], FormatAndFile* input,
   output->format = kDefaultOutputFormat;
   input->filename = kDefaultInputFilename;
   input->format = kDefaultInputFormat;
+
   int opt;
-  while ((opt = getopt(argc, argv, "i:o:I:O:")) != -1) {
+  while ((opt = getopt(argc, argv, "i:o:I:O:v:")) != -1) {
     switch (opt) {
       case 'i': {
         input->filename = optarg;
@@ -58,6 +59,10 @@ bool ParseArguments(int argc, char* argv[], FormatAndFile* input,
         output->format = optarg;
         break;
       }
+      case 'v': {
+        quipper::SetVerbosityLevel(atoi(optarg));
+        break;
+      }
       default:
         return false;
     }
@@ -68,17 +73,16 @@ bool ParseArguments(int argc, char* argv[], FormatAndFile* input,
 void PrintUsage() {
   LOG(INFO) << "Usage:";
   LOG(INFO) << "<exe> -i <input filename> -I <input format>"
-            << " -o <output filename> -O <output format>";
+            << " -o <output filename> -O <output format> -v <verbosity level>";
   LOG(INFO) << "Format options are: '" << kPerfFormat << "' for perf.data"
             << " and '" << kProtoTextFormat << "' for proto text.";
   LOG(INFO) << "By default it reads from perf.data and outputs to /dev/stdout"
             << " in proto text format.";
+  LOG(INFO) << "Default verbosity level is 0. Higher values increase verbosity."
+            << " Negative values filter LOG() levels.";
 }
 }  // namespace
 
-// Usage is:
-// <exe> -i <input filename> -f <input format> -o <output filename> -f
-// <output format>
 int main(int argc, char* argv[]) {
   FormatAndFile input, output;
   if (!ParseArguments(argc, argv, &input, &output)) {

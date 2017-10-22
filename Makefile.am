@@ -1,8 +1,9 @@
 ## Process this file with automake to produce Makefile.in
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src
-AM_CXXFLAGS = -std=gnu++11
+AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src -I$(top_srcdir)/chromiumos-wide-profiling/compat/ext -I/home/qe/Install/generic/protobuf/include -I/home/qe/Install/generic/llvm5/include
+AM_CXXFLAGS = -g -std=gnu++11
+AM_LDFLAGS = $(LLVM_LDFLAGS) -L/home/qe/Install/generic/googletest/lib -lgtest -L/home/qe/Install/generic/protobuf/lib -lprotobuf -pthread -lpthread -lelf
 
 COMMON_PROFILE_CREATOR_FILES = addr2line.cc gcov.cc instruction_map.cc \
                                module_grouper.cc profile_creator.cc \
@@ -41,15 +42,18 @@ profile_update_LDADD = libquipper.a libglog.a libsymbolize.a libgflags.a
 bin_PROGRAMS += create_llvm_prof
 create_llvm_prof_SOURCES = $(COMMON_PROFILE_CREATOR_FILES) \
                            llvm_profile_writer.cc create_llvm_prof.cc
-create_llvm_prof_LDADD = $(LLVM_LDFLAGS) libquipper.a libglog.a libsymbolize.a \
+create_llvm_prof_LDADD = libquipper.a libglog.a libsymbolize.a \
                          libgflags.a
 create_llvm_prof_CXXFLAGS = $(LLVM_CXXFLAGS)
 
 noinst_LIBRARIES = libquipper.a
-libquipper_a_SOURCES = chromiumos-wide-profiling/address_mapper.cc chromiumos-wide-profiling/perf_reader.cc \
-                       chromiumos-wide-profiling/perf_parser.cc chromiumos-wide-profiling/utils.cc \
-                       chromiumos-wide-profiling/buffer_reader.cc chromiumos-wide-profiling/data_reader.cc \
-                       chromiumos-wide-profiling/buffer_writer.cc chromiumos-wide-profiling/data_writer.cc
+
+$(top_srcdir)/chromiumos-wide-profiling/libquipper.a:
+	echo "[MAKE]    Building protobuf"
+	$(MAKE) -C $(top_srcdir)/chromiumos-wide-profiling -f Makefile.external
+
+libquipper.a: $(top_srcdir)/chromiumos-wide-profiling/libquipper.a
+	cp $(top_srcdir)/chromiumos-wide-profiling/libquipper.a $(top_srcdir)
 
 noinst_LIBRARIES += libglog.a
 libglog_a_SOURCES = glog/src/glog/log_severity.h \

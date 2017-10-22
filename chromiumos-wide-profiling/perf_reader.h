@@ -8,85 +8,42 @@
 #include <stdint.h>
 
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "base/macros.h"
 
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/kernel/perf_internals.h"
-#include "chromiumos-wide-profiling/utils.h"
+#include "compat/proto.h"
+#include "compat/string.h"
+#include "kernel/perf_event.h"
+#include "perf_serializer.h"
+#include "sample_info_reader.h"
 
 namespace quipper {
-
-// This is becoming more like a partial struct perf_evsel
-struct PerfFileAttr {
-  struct perf_event_attr attr;
-  string name;
-  std::vector<u64> ids;
-};
 
 // Based on code in tools/perf/util/header.c, the metadata are of the following
 // formats:
 
-// Based on kernel/perf_internals.h
-const size_t kBuildIDArraySize = 20;
-const size_t kBuildIDStringLength = kBuildIDArraySize * 2;
-
-struct CStringWithLength {
-  u32 len;
-  string str;
-};
-
-struct PerfStringMetadata {
-  u32 type;
-  std::vector<CStringWithLength> data;
-};
-
-struct PerfUint32Metadata {
-  u32 type;
-  std::vector<uint32_t> data;
-};
-
-struct PerfUint64Metadata {
-  u32 type;
-  std::vector<uint64_t> data;
-};
-
 typedef u32 num_siblings_type;
-
-struct PerfCPUTopologyMetadata {
-  std::vector<CStringWithLength> core_siblings;
-  std::vector<CStringWithLength> thread_siblings;
-};
-
-struct PerfNodeTopologyMetadata {
-  u32 id;
-  u64 total_memory;
-  u64 free_memory;
-  CStringWithLength cpu_list;
-};
 
 class DataReader;
 class DataWriter;
 
+struct PerfFileAttr;
+
 class PerfReader {
  public:
-  PerfReader() : sample_type_(0),
-                 read_format_(0),
-                 is_cross_endian_(0) {}
+  PerfReader();
   ~PerfReader();
 
-  // Makes |build_id| fit the perf format, by either truncating it or adding
-  // zeros to the end so that it has length kBuildIDStringLength.
-  static void PerfizeBuildIDString(string* build_id);
-
-  // Changes |build_id| to the best guess of what the build id was before going
-  // through perf.  Specifically, it keeps removing trailing sequences of four
-  // zero bytes (or eight '0' characters) until there are no more such
-  // sequences, or the build id would be empty if the process were repeated.
-  static void UnperfizeBuildIDString(string* build_id);
+  // Copy stored contents to |*perf_data_proto|. Appends a timestamp. Returns
+  // true on success.
+  bool Serialize(PerfDataProto* perf_data_proto) const;
+  // Read in contents from a protobuf. Returns true on success.
+  bool Deserialize(const PerfDataProto& perf_data_proto);
 
   bool ReadFile(const string& filename);
   bool ReadFromVector(const std::vector<char>& data);
@@ -94,21 +51,10 @@ class PerfReader {
   bool ReadFromPointer(const char* data, size_t size);
   bool ReadFromData(DataReader* data);
 
-  // TODO(rohinmshah): GetSize should not use RegenerateHeader (so that it can
-  // be const).  Ideally, RegenerateHeader would be deleted and instead of
-  // having out_header_ as an instance variable, it would be computed
-  // dynamically whenever needed.
-
-  // Returns the size in bytes that would be written by any of the methods that
-  // write the entire perf data file (WriteFile, WriteToPointer, etc).
-  size_t GetSize();
-
   bool WriteFile(const string& filename);
   bool WriteToVector(std::vector<char>* data);
   bool WriteToString(string* str);
   bool WriteToPointer(char* buffer, size_t size);
-
-  bool RegenerateHeader();
 
   // Stores the mapping from filenames to build ids in build_id_events_.
   // Returns true on success.
@@ -138,63 +84,56 @@ class PerfReader {
   void GetFilenamesToBuildIDs(
       std::map<string, string>* filenames_to_build_ids) const;
 
-  static bool IsSupportedEventType(uint32_t type);
+  // Sort all events in |proto_| by timestamps if they are available. Otherwise
+  // event order is unchanged.
+  void MaybeSortEventsByTime();
 
-  // If a program using PerfReader calls events(), it could work with the
-  // resulting events by importing kernel/perf_internals.h.  This would also
-  // apply to other forms of data (attributes, event types, build ids, etc.)
-  // However, there is no easy way to work with the sample info within events.
-  // The following two methods have been added for this purpose.
+  // Accessors and mutators.
 
-  // Extracts from a perf event |event| info about the perf sample that
-  // contains the event.  Stores info in |sample|.
-  bool ReadPerfSampleInfo(const event_t& event,
-                          struct perf_sample* sample) const;
-  // Writes |sample| info back to a perf event |event|.
-  bool WritePerfSampleInfo(const perf_sample& sample,
-                           event_t* event) const;
+  // This is a plain accessor for the internal protobuf storage. It is meant for
+  // exposing the internals. This is not initialized until Read*() or
+  // Deserialize() has been called.
+  //
+  // Call Serialize() instead of this function to acquire an "official" protobuf
+  // with a timestamp.
+  const PerfDataProto& proto() const { return *proto_; }
 
-  // Accessor funcs.
-  const std::vector<PerfFileAttr>& attrs() const {
-    return attrs_;
+  const RepeatedPtrField<PerfDataProto_PerfFileAttr>& attrs() const {
+    return proto_->file_attrs();
+  }
+  const RepeatedPtrField<PerfDataProto_PerfEventType>& event_types() const {
+    return proto_->event_types();
   }
 
-  uint64_t sample_type() const {
-    return sample_type_;
+  const RepeatedPtrField<PerfDataProto_PerfEvent>& events() const {
+    return proto_->events();
+  }
+  // WARNING: Modifications to the protobuf events may change the amount of
+  // space required to store the corresponding raw event. If that happens, the
+  // caller is responsible for correctly updating the size in the event header.
+  RepeatedPtrField<PerfDataProto_PerfEvent>* mutable_events() {
+    return proto_->mutable_events();
   }
 
-  bool HaveEventNames() const {
-    for (const auto& attr : attrs_) {
-      if (attr.name.empty()) {
-        return false;
-      }
-    }
-    return true;
+  const RepeatedPtrField<PerfDataProto_PerfBuildID>& build_ids() const {
+    return proto_->build_ids();
+  }
+  RepeatedPtrField<PerfDataProto_PerfBuildID>* mutable_build_ids() {
+    return proto_->mutable_build_ids();
   }
 
-  const std::vector<malloced_unique_ptr<event_t>>& events() const {
-    return events_;
+  const string& tracing_data() const {
+    return proto_->tracing_data().tracing_data();
   }
 
-  const std::vector<build_id_event*>& build_id_events() const {
-    return build_id_events_;
+  const PerfDataProto_StringMetadata& string_metadata() const {
+    return proto_->string_metadata();
   }
 
-  const std::vector<char>& tracing_data() const {
-    return tracing_data_;
-  }
+  uint64_t metadata_mask() const { return proto_->metadata_mask().Get(0); }
 
-  uint64_t metadata_mask() const {
-    return metadata_mask_;
-  }
-
-  const std::vector<PerfStringMetadata>& string_metadata() const {
-    return string_metadata_;
-  }
-
- protected:
+ private:
   bool ReadHeader(DataReader* data);
-
   bool ReadAttrsSection(DataReader* data);
   bool ReadAttr(DataReader* data);
   bool ReadEventAttr(DataReader* data, perf_event_attr* attr);
@@ -202,7 +141,7 @@ class PerfReader {
 
   bool ReadEventTypesSection(DataReader* data);
   // if event_size == 0, then not in an event.
-  bool ReadEventType(DataReader* data, size_t attr_idx, size_t event_size);
+  bool ReadEventType(DataReader* data, int attr_idx, size_t event_size);
 
   bool ReadDataSection(DataReader* data);
 
@@ -218,7 +157,23 @@ class PerfReader {
   bool ReadBuildIDMetadataWithoutHeader(DataReader* data,
                                         const perf_event_header& header);
 
-  bool ReadStringMetadata(DataReader* data, u32 type, size_t size);
+  // Reads a singular string metadata field (with preceding size field) from
+  // |data| and writes the string and its Md5sum prefix into |dest|.
+  bool ReadSingleStringMetadata(
+      DataReader* data,
+      size_t max_readable_size,
+      PerfDataProto_StringMetadata_StringAndMd5sumPrefix* dest) const;
+  // Reads a string metadata with multiple string fields (each with preceding
+  // size field) from |data|. Writes each string field and its Md5sum prefix
+  // into |dest_array|. Writes the combined string fields (joined into one
+  // string into |dest_single|.
+  bool ReadRepeatedStringMetadata(
+      DataReader* data,
+      size_t max_readable_size,
+      RepeatedPtrField<PerfDataProto_StringMetadata_StringAndMd5sumPrefix>*
+          dest_array,
+      PerfDataProto_StringMetadata_StringAndMd5sumPrefix* dest_single) const;
+
   bool ReadUint32Metadata(DataReader* data, u32 type, size_t size);
   bool ReadUint64Metadata(DataReader* data, u32 type, size_t size);
   bool ReadCPUTopologyMetadata(DataReader* data, u32 type, size_t size);
@@ -228,18 +183,34 @@ class PerfReader {
   // Read perf data from piped perf output data.
   bool ReadPipedData(DataReader* data);
 
+  // Returns the size in bytes that would be written by any of the methods that
+  // write the entire perf data file (WriteFile, WriteToPointer, etc).
+  size_t GetSize() const;
+
+  // Populates |*header| with the proper contents based on the perf data that
+  // has been read.
+  void GenerateHeader(struct perf_file_header* header) const;
+
   // Like WriteToPointer, but does not check if the buffer is large enough.
   bool WriteToPointerWithoutCheckingSize(char* buffer, size_t size);
 
-  bool WriteHeader(DataWriter* data) const;
-  bool WriteAttrs(DataWriter* data) const;
-  bool WriteEventTypes(DataWriter* data) const;
-  bool WriteData(DataWriter* data) const;
-  bool WriteMetadata(DataWriter* data) const;
+  bool WriteHeader(const struct perf_file_header& header,
+                   DataWriter* data) const;
+  bool WriteAttrs(const struct perf_file_header& header,
+                  DataWriter* data) const;
+  bool WriteData(const struct perf_file_header& header, DataWriter* data) const;
+  bool WriteMetadata(const struct perf_file_header& header,
+                     DataWriter* data) const;
 
   // For writing the various types of metadata.
   bool WriteBuildIDMetadata(u32 type, DataWriter* data) const;
-  bool WriteStringMetadata(u32 type, DataWriter* data) const;
+  bool WriteSingleStringMetadata(
+      const PerfDataProto_StringMetadata_StringAndMd5sumPrefix& src,
+      DataWriter* data) const;
+  bool WriteRepeatedStringMetadata(
+      const RepeatedPtrField<
+          PerfDataProto_StringMetadata_StringAndMd5sumPrefix>& src_array,
+      DataWriter* data) const;
   bool WriteUint32Metadata(u32 type, DataWriter* data) const;
   bool WriteUint64Metadata(u32 type, DataWriter* data) const;
   bool WriteEventDescMetadata(u32 type, DataWriter* data) const;
@@ -250,8 +221,8 @@ class PerfReader {
   bool ReadAttrEventBlock(DataReader* data, size_t size);
 
   // Swaps byte order for non-header fields of the data structure pointed to by
-  // |event|, if |is_cross_endian_| is true. Otherwise leaves the data the same.
-  void MaybeSwapEventFields(event_t* event);
+  // |event|, if |is_cross_endian| is true. Otherwise leaves the data the same.
+  void MaybeSwapEventFields(event_t* event, bool is_cross_endian);
 
   // Returns the number of types of metadata stored and written to output data.
   size_t GetNumSupportedMetadata() const;
@@ -273,29 +244,38 @@ class PerfReader {
   // This method does not change |build_id_events_|.
   bool LocalizeMMapFilenames(const std::map<string, string>& filename_map);
 
-  std::vector<PerfFileAttr> attrs_;
-  std::vector<malloced_unique_ptr<event_t>> events_;
-  std::vector<build_id_event*> build_id_events_;
-  std::vector<PerfStringMetadata> string_metadata_;
-  std::vector<PerfUint32Metadata> uint32_metadata_;
-  std::vector<PerfUint64Metadata> uint64_metadata_;
-  PerfCPUTopologyMetadata cpu_topology_;
-  std::vector<PerfNodeTopologyMetadata> numa_topology_;
-  std::vector<char> tracing_data_;
-  uint64_t sample_type_;
-  uint64_t read_format_;
-  uint64_t metadata_mask_;
+  // Stores a PerfFileAttr in |proto_| and updates |serializer_|.
+  void AddPerfFileAttr(const PerfFileAttr& attr);
 
-  // Indicates that the perf data being read is from machine with a different
-  // endianness than the current machine.
-  bool is_cross_endian_;
+  bool get_metadata_mask_bit(uint32_t bit) const {
+    return metadata_mask() & (1 << bit);
+  }
+  void set_metadata_mask_bit(uint32_t bit) {
+    proto_->set_metadata_mask(0, metadata_mask() | (1 << bit));
+  }
 
- private:
   // The file header is either a normal header or a piped header.
   union {
     struct perf_file_header header_;
     struct perf_pipe_file_header piped_header_;
   };
+
+  // Store the perf data as a protobuf.
+  Arena arena_;
+  PerfDataProto* proto_;
+  // Attribute ids that have been added to |proto_|, for deduplication.
+  std::unordered_set<u64> file_attrs_seen_;
+
+  // Whether the incoming data is from a machine with a different endianness. We
+  // got rid of this flag in the past but now we need to store this so it can be
+  // passed to |serializer_|.
+  bool is_cross_endian_;
+
+  // For serializing individual events.
+  PerfSerializer serializer_;
+
+  // When writing to a new perf data file, this is used to hold the generated
+  // file header, which may differ from the input file header, if any.
   struct perf_file_header out_header_;
 
   DISALLOW_COPY_AND_ASSIGN(PerfReader);

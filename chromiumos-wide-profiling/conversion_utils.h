@@ -7,7 +7,7 @@
 
 #include <string>
 
-#include "chromiumos-wide-profiling/compat/string.h"
+#include "compat/string.h"
 
 namespace quipper {
 

@@ -4,7 +4,9 @@
 #define PERF_INTERNALS_H_
 
 #include <linux/limits.h>
+#include <stddef.h>  // For NULL
 #include <stdint.h>
+#include <sys/types.h>  // For pid_t
 
 #include "perf_event.h"
 
@@ -200,7 +202,7 @@ struct sample_read_value {
 struct sample_read {
 	u64 time_enabled;
 	u64 time_running;
-	union {
+	struct {
 		struct {
 			u64 nr;
 			struct sample_read_value *values;
@@ -256,26 +258,23 @@ struct perf_sample {
 	struct branch_stack *branch_stack;
 	//struct regs_dump  user_regs;  // See struct regs_dump above.
 	struct stack_dump user_stack;
-	struct {  // Copied from struct read_event.
-		u64 time_enabled;
-		u64 time_running;
-		u64 id;
-	} read;
-	// TODO(dhsharp) replace struct above with:
-	// struct sample_read read;
+	struct sample_read read;
 
 	perf_sample() : raw_data(NULL),
 			callchain(NULL),
-			branch_stack(NULL) {}
+			branch_stack(NULL) {
+	  read.group.values = NULL;
+	}
 	~perf_sample() {
 	  delete [] callchain;
 	  delete [] branch_stack;
 	  delete [] reinterpret_cast<char*>(raw_data);
+	  delete [] read.group.values;
 	}
 };
 
 // Taken from tools/perf/util/include/linux/kernel.h
-#define ALIGN(x,a)		__ALIGN_MASK(x,(typeof(x))(a)-1)
+#define ALIGN(x,a)		__ALIGN_MASK(x,(decltype(x))(a)-1)
 #define __ALIGN_MASK(x,mask)	(((x)+(mask))&~(mask))
 
 // If this is changed, kBuildIDArraySize in perf_reader.h must also be changed.

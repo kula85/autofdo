@@ -2,30 +2,41 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "chromiumos-wide-profiling/perf_reader.h"
+#include "perf_reader.h"
 
-#include <byteswap.h>
-#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
 
 #include <algorithm>
-#include <bitset>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <type_traits>
 #include <vector>
 
 #include "base/logging.h"
+#include "base/macros.h"
 
-#include "chromiumos-wide-profiling/buffer_reader.h"
-#include "chromiumos-wide-profiling/buffer_writer.h"
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/limits.h"
-#include "chromiumos-wide-profiling/utils.h"
+#include "binary_data_utils.h"
+#include "buffer_reader.h"
+#include "buffer_writer.h"
+#include "compat/string.h"
+#include "file_reader.h"
+#include "file_utils.h"
+#include "perf_data_structures.h"
+#include "perf_data_utils.h"
+#include "sample_info_reader.h"
 
 namespace quipper {
 
+using PerfEvent = PerfDataProto_PerfEvent;
+using SampleInfo = PerfDataProto_SampleInfo;
+using StringAndMd5sumPrefix =
+    PerfDataProto_StringMetadata_StringAndMd5sumPrefix;
+
 namespace {
+
+// The type of the storage size of a string, prefixed before each string field
+// in raw data.
+typedef u32 string_size_type;
 
 // The type of the number of string data, found in the command line metadata in
 // the perf data file.
@@ -39,7 +50,7 @@ typedef u32 event_desc_num_unique_ids;
 // The type of the number of nodes field in NUMA topology.
 typedef u32 numa_topology_num_nodes_type;
 
-// A mask that is applied to metadata_mask_ in order to get a mask for
+// A mask that is applied to |metadata_mask()| in order to get a mask for
 // only the metadata supported by quipper.
 const uint32_t kSupportedMetadataMask =
     1 << HEADER_TRACING_DATA |
@@ -61,49 +72,9 @@ const uint32_t kSupportedMetadataMask =
 // By default, the build ID event has PID = -1.
 const uint32_t kDefaultBuildIDEventPid = static_cast<uint32_t>(-1);
 
-// Returns the number of bits in a numerical value.
-template <typename T>
-size_t GetNumBits(const T& value) {
-  std::bitset<sizeof(T) * CHAR_BIT> bits(value);
-  return bits.count();
-}
-
 // Eight bits in a byte.
 size_t BytesToBits(size_t num_bytes) {
   return num_bytes * 8;
-}
-
-template <class T>
-void ByteSwap(T* input) {
-  switch (sizeof(T)) {
-  case sizeof(uint8_t):
-    LOG(WARNING) << "Attempting to byte swap on a single byte.";
-    break;
-  case sizeof(uint16_t):
-    *input = bswap_16(*input);
-    break;
-  case sizeof(uint32_t):
-    *input = bswap_32(*input);
-    break;
-  case sizeof(uint64_t):
-    *input = bswap_64(*input);
-    break;
-  default:
-    LOG(FATAL) << "Invalid size for byte swap: " << sizeof(T) << " bytes";
-    break;
-  }
-}
-
-u64 MaybeSwap(u64 value, bool swap) {
-  if (swap)
-    return bswap_64(value);
-  return value;
-}
-
-u32 MaybeSwap(u32 value, bool swap) {
-  if (swap)
-    return bswap_32(value);
-  return value;
 }
 
 u8 ReverseByte(u8 x) {
@@ -153,495 +124,111 @@ void CheckNoBuildIDEventPadding() {
            sizeof(event.build_id));
 }
 
-// Creates/updates a build id event with |build_id| and |filename|.
-// Passing "" to |build_id| or |filename| will leave the corresponding field
-// unchanged (in which case |event| must be non-null).
-// If |event| is null or is not large enough, a new event will be created.
-// In this case, if |event| is non-null, it will be freed.
-// Otherwise, updates the fields of the existing event.
-// |new_misc| indicates kernel vs user space, and is only used to fill in the
-// |header.misc| field of new events.
-// In either case, returns a pointer to the event containing the updated data,
-// or NULL in the case of a failure.
-build_id_event* CreateOrUpdateBuildID(const string& build_id,
-                                      const string& filename,
-                                      uint16_t new_misc,
-                                      build_id_event* event) {
-  // When creating an event from scratch, build id and filename must be present.
-  if (!event && (build_id.empty() || filename.empty()))
-    return NULL;
-  size_t new_len = GetUint64AlignedStringLength(
-      filename.empty() ? event->filename : filename);
+// Creates a new build ID event with the given build ID string, filename, and
+// misc value.
+malloced_unique_ptr<build_id_event> CreateBuildIDEvent(const string& build_id,
+                                                       const string& filename,
+                                                       uint16_t misc) {
+  size_t filename_len = GetUint64AlignedStringLength(filename);
+  size_t size = sizeof(struct build_id_event) + filename_len;
+  malloced_unique_ptr<build_id_event> event(CallocMemoryForBuildID(size));
+  event->header.type = HEADER_BUILD_ID;
+  event->header.misc = misc;
+  event->header.size = size;
 
-  // If event is null, or we don't have enough memory, allocate more memory, and
-  // switch the new pointer with the existing pointer.
-  size_t new_size = sizeof(*event) + new_len;
-  if (!event || new_size > event->header.size) {
-    build_id_event* new_event = CallocMemoryForBuildID(new_size);
+  event->pid = kDefaultBuildIDEventPid;
+  snprintf(event->filename, filename_len, "%s", filename.c_str());
+  memset(event->filename + filename.size(), 0, filename_len - filename.size());
 
-    if (event) {
-      // Copy over everything except the filename and free the event.
-      // It is guaranteed that we are changing the filename - otherwise, the old
-      // size and the new size would be equal.
-      *new_event = *event;
-      free(event);
-    } else {
-      // Fill in the fields appropriately.
-      new_event->header.type = HEADER_BUILD_ID;
-      new_event->header.misc = new_misc;
-      new_event->pid = kDefaultBuildIDEventPid;
-    }
-    event = new_event;
-  }
-
-  // Here, event is the pointer to the build_id_event that we are keeping.
-  // Update the event's size, build id, and filename.
-  if (!build_id.empty() &&
-      !StringToHex(build_id, event->build_id, arraysize(event->build_id))) {
-    free(event);
-    return NULL;
-  }
-
-  if (!filename.empty())
-    CHECK_GT(snprintf(event->filename, new_len, "%s", filename.c_str()), 0);
-
-  event->header.size = new_size;
+  HexStringToRawData(build_id, event->build_id, sizeof(event->build_id));
   return event;
 }
 
-// Reads a CStringWithLength from |data| into |dest| at the current offset.
-bool ReadStringFromBuffer(DataReader* data,
-                          bool is_cross_endian,
-                          CStringWithLength* dest) {
-  if (!data->ReadDataValue(sizeof(dest->len), "string length", &dest->len))
-    return false;
-  if (is_cross_endian)
-    ByteSwap(&dest->len);
+// Given a string, returns the total size required to store the string in perf
+// data, including a preceding length field and extra padding to align the
+// string + null terminator to a multiple of uint64s.
+size_t ExpectedStorageSizeOf(const string& str) {
+  return sizeof(string_size_type) + GetUint64AlignedStringLength(str);
+}
 
-  if (!data->ReadString(dest->len, &dest->str)) {
-    LOG(ERROR) << "Failed to read string from data. len: " << dest->len;
+// Reads a perf_event_header from |data| and performs byte swapping if
+// necessary. Returns true on success, or false if there was an error.
+bool ReadPerfEventHeader(DataReader* data, struct perf_event_header* header) {
+  if (!data->ReadData(sizeof(struct perf_event_header), header)) {
+    LOG(ERROR) << "Error reading perf event header.";
     return false;
+  }
+  if (data->is_cross_endian()) {
+    ByteSwap(&header->type);
+    ByteSwap(&header->size);
+    ByteSwap(&header->misc);
   }
   return true;
 }
 
-// Writes a CStringWithLength from |src| to |data|.
-bool WriteStringToBuffer(const CStringWithLength& src, DataWriter* data) {
-  if (data->Tell() + src.len + sizeof(src.len) > data->size()) {
-    LOG(ERROR) << "Not enough space to write string.";
+// Reads a perf_file_section from |data| and performs byte swapping if
+// necessary. Returns true on success, or false if there was an error.
+bool ReadPerfFileSection(DataReader* data, struct perf_file_section* section) {
+  if (!data->ReadData(sizeof(*section), section)) {
+    LOG(ERROR) << "Error reading perf file section info.";
     return false;
   }
-
-  if (!data->WriteDataValue(&src.len, sizeof(src.len), "string length") ||
-      !data->WriteString(src.str, src.len)) {
-    LOG(ERROR) << "Failed to write string.";
-    return false;
+  if (data->is_cross_endian()) {
+    ByteSwap(&section->offset);
+    ByteSwap(&section->size);
   }
   return true;
 }
 
-// Read read info from perf data.  Corresponds to sample format type
-// PERF_SAMPLE_READ.
-const uint64_t* ReadReadInfo(const uint64_t* array,
-                             bool swap_bytes,
-                             uint64_t read_format,
-                             struct perf_sample* sample) {
-  if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
-    sample->read.time_enabled = *array++;
-  if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
-    sample->read.time_running = *array++;
-  if (read_format & PERF_FORMAT_ID)
-    sample->read.id = *array++;
-
-  if (swap_bytes) {
-    ByteSwap(&sample->read.time_enabled);
-    ByteSwap(&sample->read.time_running);
-    ByteSwap(&sample->read.id);
-  }
-
-  return array;
-}
-
-// Read call chain info from perf data.  Corresponds to sample format type
-// PERF_SAMPLE_CALLCHAIN.
-const uint64_t* ReadCallchain(const uint64_t* array,
-                              bool swap_bytes,
-                              struct perf_sample* sample) {
-  // Make sure there is no existing allocated memory in |sample->callchain|.
-  CHECK_EQ(static_cast<void*>(NULL), sample->callchain);
-
-  // The callgraph data consists of a uint64_t value |nr| followed by |nr|
-  // addresses.
-  uint64_t callchain_size = *array++;
-  if (swap_bytes)
-    ByteSwap(&callchain_size);
-  struct ip_callchain* callchain =
-      reinterpret_cast<struct ip_callchain*>(new uint64_t[callchain_size + 1]);
-  callchain->nr = callchain_size;
-  for (size_t i = 0; i < callchain_size; ++i) {
-    callchain->ips[i] = *array++;
-    if (swap_bytes)
-      ByteSwap(&callchain->ips[i]);
-  }
-  sample->callchain = callchain;
-
-  return array;
-}
-
-// Read raw info from perf data.  Corresponds to sample format type
-// PERF_SAMPLE_RAW.
-const uint64_t* ReadRawData(const uint64_t* array,
-                            bool swap_bytes,
-                            struct perf_sample* sample) {
-  // First read the size.
-  const uint32_t* ptr = reinterpret_cast<const uint32_t*>(array);
-  sample->raw_size = *ptr++;
-  if (swap_bytes)
-    ByteSwap(&sample->raw_size);
-
-  // Allocate space for and read the raw data bytes.
-  sample->raw_data = new uint8_t[sample->raw_size];
-  memcpy(sample->raw_data, ptr, sample->raw_size);
-
-  // Determine the bytes that were read, and align to the next 64 bits.
-  int bytes_read = AlignSize(sizeof(sample->raw_size) + sample->raw_size,
-                             sizeof(uint64_t));
-  array += bytes_read / sizeof(uint64_t);
-
-  return array;
-}
-
-// Read call chain info from perf data.  Corresponds to sample format type
-// PERF_SAMPLE_CALLCHAIN.
-const uint64_t* ReadBranchStack(const uint64_t* array,
-                                bool swap_bytes,
-                                struct perf_sample* sample) {
-  // Make sure there is no existing allocated memory in
-  // |sample->branch_stack|.
-  CHECK_EQ(static_cast<void*>(NULL), sample->branch_stack);
-
-  // The branch stack data consists of a uint64_t value |nr| followed by |nr|
-  // branch_entry structs.
-  uint64_t branch_stack_size = *array++;
-  if (swap_bytes)
-    ByteSwap(&branch_stack_size);
-  struct branch_stack* branch_stack =
-      reinterpret_cast<struct branch_stack*>(
-          new uint8_t[sizeof(uint64_t) +
-                      branch_stack_size * sizeof(struct branch_entry)]);
-  branch_stack->nr = branch_stack_size;
-  for (size_t i = 0; i < branch_stack_size; ++i) {
-    memcpy(&branch_stack->entries[i], array, sizeof(struct branch_entry));
-    array += sizeof(struct branch_entry) / sizeof(*array);
-    if (swap_bytes) {
-      ByteSwap(&branch_stack->entries[i].from);
-      ByteSwap(&branch_stack->entries[i].to);
-    }
-  }
-  sample->branch_stack = branch_stack;
-
-  return array;
-}
-
-size_t ReadPerfSampleFromData(const perf_event_type event_type,
-                              const uint64_t* array,
-                              const uint64_t sample_fields,
-                              const uint64_t read_format,
-                              bool swap_bytes,
-                              struct perf_sample* sample) {
-  const uint64_t* initial_array_ptr = array;
-
-  union {
-    uint32_t val32[sizeof(uint64_t) / sizeof(uint32_t)];
-    uint64_t val64;
-  };
-
-  // See structure for PERF_RECORD_SAMPLE in kernel/perf_event.h
-  // and compare sample_id when sample_id_all is set.
-
-  // NB: For sample_id, sample_fields has already been masked to the set
-  // of fields in that struct by GetSampleFieldsForEventType. That set
-  // of fields is mostly in the same order as PERF_RECORD_SAMPLE, with
-  // the exception of PERF_SAMPLE_IDENTIFIER.
-
-  // PERF_SAMPLE_IDENTIFIER is in a different location depending on
-  // if this is a SAMPLE event or the sample_id of another event.
-  if (event_type == PERF_RECORD_SAMPLE) {
-    // { u64                   id;       } && PERF_SAMPLE_IDENTIFIER
-    if (sample_fields & PERF_SAMPLE_IDENTIFIER) {
-      sample->id = MaybeSwap(*array++, swap_bytes);
-    }
-  }
-
-  // { u64                   ip;       } && PERF_SAMPLE_IP
-  if (sample_fields & PERF_SAMPLE_IP) {
-    sample->ip = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { u32                   pid, tid; } && PERF_SAMPLE_TID
-  if (sample_fields & PERF_SAMPLE_TID) {
-    val64 = *array++;
-    sample->pid = MaybeSwap(val32[0], swap_bytes);
-    sample->tid = MaybeSwap(val32[1], swap_bytes);
-  }
-
-  // { u64                   time;     } && PERF_SAMPLE_TIME
-  if (sample_fields & PERF_SAMPLE_TIME) {
-    sample->time = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { u64                   addr;     } && PERF_SAMPLE_ADDR
-  if (sample_fields & PERF_SAMPLE_ADDR) {
-    sample->addr = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { u64                   id;       } && PERF_SAMPLE_ID
-  if (sample_fields & PERF_SAMPLE_ID) {
-    sample->id = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { u64                   stream_id;} && PERF_SAMPLE_STREAM_ID
-  if (sample_fields & PERF_SAMPLE_STREAM_ID) {
-    sample->stream_id = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { u32                   cpu, res; } && PERF_SAMPLE_CPU
-  if (sample_fields & PERF_SAMPLE_CPU) {
-    val64 = *array++;
-    sample->cpu = MaybeSwap(val32[0], swap_bytes);
-    // sample->res = MaybeSwap(*val32[1], swap_bytes);  // not implemented?
-  }
-
-  // This is the location of PERF_SAMPLE_IDENTIFIER in struct sample_id.
-  if (event_type != PERF_RECORD_SAMPLE) {
-    // { u64                   id;       } && PERF_SAMPLE_IDENTIFIER
-    if (sample_fields & PERF_SAMPLE_IDENTIFIER) {
-      sample->id = MaybeSwap(*array++, swap_bytes);
-    }
-  }
-
-  //
-  // The remaining fields are only in PERF_RECORD_SAMPLE
-  //
-
-  // { u64                   period;   } && PERF_SAMPLE_PERIOD
-  if (sample_fields & PERF_SAMPLE_PERIOD) {
-    sample->period = MaybeSwap(*array++, swap_bytes);
-  }
-
-  // { struct read_format    values;   } && PERF_SAMPLE_READ
-  if (sample_fields & PERF_SAMPLE_READ) {
-    // TODO(cwp-team): support grouped read info.
-    if (read_format & PERF_FORMAT_GROUP)
-      return 0;
-    array = ReadReadInfo(array, swap_bytes, read_format, sample);
-  }
-
-  // { u64                   nr,
-  //   u64                   ips[nr];  } && PERF_SAMPLE_CALLCHAIN
-  if (sample_fields & PERF_SAMPLE_CALLCHAIN) {
-    array = ReadCallchain(array, swap_bytes, sample);
-  }
-
-  // { u32                   size;
-  //   char                  data[size];}&& PERF_SAMPLE_RAW
-  if (sample_fields & PERF_SAMPLE_RAW) {
-    array = ReadRawData(array, swap_bytes, sample);
-  }
-
-  // { u64                   nr;
-  //   { u64 from, to, flags } lbr[nr];} && PERF_SAMPLE_BRANCH_STACK
-  if (sample_fields & PERF_SAMPLE_BRANCH_STACK) {
-    array = ReadBranchStack(array, swap_bytes, sample);
-  }
-
-  static const u64 kUnimplementedSampleFields =
-      PERF_SAMPLE_REGS_USER  |
-      PERF_SAMPLE_STACK_USER |
-      PERF_SAMPLE_WEIGHT     |
-      PERF_SAMPLE_DATA_SRC   |
-      PERF_SAMPLE_TRANSACTION;
-
-  if (sample_fields & kUnimplementedSampleFields) {
-    LOG(WARNING) << "Unimplemented sample fields 0x"
-                 << std::hex << (sample_fields & kUnimplementedSampleFields);
-  }
-
-  if (sample_fields & ~(PERF_SAMPLE_MAX-1)) {
-    LOG(WARNING) << "Unrecognized sample fields 0x"
-                 << std::hex << (sample_fields & ~(PERF_SAMPLE_MAX-1));
-  }
-
-  return (array - initial_array_ptr) * sizeof(uint64_t);
-}
-
-size_t WritePerfSampleToData(const perf_event_type event_type,
-                             const struct perf_sample& sample,
-                             const uint64_t sample_fields,
-                             const uint64_t read_format,
-                             uint64_t* array) {
-  const uint64_t* initial_array_ptr = array;
-
-  union {
-    uint32_t val32[sizeof(uint64_t) / sizeof(uint32_t)];
-    uint64_t val64;
-  };
-
-  // See notes at the top of ReadPerfSampleFromData regarding the structure
-  // of PERF_RECORD_SAMPLE, sample_id, and PERF_SAMPLE_IDENTIFIER, as they
-  // all apply here as well.
-
-  // PERF_SAMPLE_IDENTIFIER is in a different location depending on
-  // if this is a SAMPLE event or the sample_id of another event.
-  if (event_type == PERF_RECORD_SAMPLE) {
-    // { u64                   id;       } && PERF_SAMPLE_IDENTIFIER
-    if (sample_fields & PERF_SAMPLE_IDENTIFIER) {
-      *array++ = sample.id;
-    }
-  }
-
-  // { u64                   ip;       } && PERF_SAMPLE_IP
-  if (sample_fields & PERF_SAMPLE_IP) {
-    *array++ = sample.ip;
-  }
-
-  // { u32                   pid, tid; } && PERF_SAMPLE_TID
-  if (sample_fields & PERF_SAMPLE_TID) {
-    val32[0] = sample.pid;
-    val32[1] = sample.tid;
-    *array++ = val64;
-  }
-
-  // { u64                   time;     } && PERF_SAMPLE_TIME
-  if (sample_fields & PERF_SAMPLE_TIME) {
-    *array++ = sample.time;
-  }
-
-  // { u64                   addr;     } && PERF_SAMPLE_ADDR
-  if (sample_fields & PERF_SAMPLE_ADDR) {
-    *array++ = sample.addr;
-  }
-
-  // { u64                   id;       } && PERF_SAMPLE_ID
-  if (sample_fields & PERF_SAMPLE_ID) {
-    *array++ = sample.id;
-  }
-
-  // { u64                   stream_id;} && PERF_SAMPLE_STREAM_ID
-  if (sample_fields & PERF_SAMPLE_STREAM_ID) {
-    *array++ = sample.stream_id;
-  }
-
-  // { u32                   cpu, res; } && PERF_SAMPLE_CPU
-  if (sample_fields & PERF_SAMPLE_CPU) {
-    val32[0] = sample.cpu;
-    // val32[1] = sample.res;  // not implemented?
-    val32[1] = 0;
-    *array++ = val64;
-  }
-
-  // This is the location of PERF_SAMPLE_IDENTIFIER in struct sample_id.
-  if (event_type != PERF_RECORD_SAMPLE) {
-    // { u64                   id;       } && PERF_SAMPLE_IDENTIFIER
-    if (sample_fields & PERF_SAMPLE_IDENTIFIER) {
-      *array++ = sample.id;
-    }
-  }
-
-  //
-  // The remaining fields are only in PERF_RECORD_SAMPLE
-  //
-
-  // { u64                   period;   } && PERF_SAMPLE_PERIOD
-  if (sample_fields & PERF_SAMPLE_PERIOD) {
-    *array++ = sample.period;
-  }
-
-  // { struct read_format    values;   } && PERF_SAMPLE_READ
-  if (sample_fields & PERF_SAMPLE_READ) {
-    // TODO(cwp-team): support grouped read info.
-    if (read_format & PERF_FORMAT_GROUP)
-      return 0;
-    if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
-      *array++ = sample.read.time_enabled;
-    if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
-      *array++ = sample.read.time_running;
-    if (read_format & PERF_FORMAT_ID)
-      *array++ = sample.read.id;
-  }
-
-  // { u64                   nr,
-  //   u64                   ips[nr];  } && PERF_SAMPLE_CALLCHAIN
-  if (sample_fields & PERF_SAMPLE_CALLCHAIN) {
-    if (!sample.callchain) {
-      LOG(ERROR) << "Expecting callchain data, but none was found.";
-    } else {
-      *array++ = sample.callchain->nr;
-      for (size_t i = 0; i < sample.callchain->nr; ++i)
-        *array++ = sample.callchain->ips[i];
-    }
-  }
-
-  // { u32                   size;
-  //   char                  data[size];}&& PERF_SAMPLE_RAW
-  if (sample_fields & PERF_SAMPLE_RAW) {
-    uint32_t* ptr = reinterpret_cast<uint32_t*>(array);
-    *ptr++ = sample.raw_size;
-    memcpy(ptr, sample.raw_data, sample.raw_size);
-
-    // Update the data read pointer after aligning to the next 64 bytes.
-    int num_bytes = AlignSize(sizeof(sample.raw_size) + sample.raw_size,
-                              sizeof(uint64_t));
-    array += num_bytes / sizeof(uint64_t);
-  }
-
-  // { u64                   nr;
-  //   { u64 from, to, flags } lbr[nr];} && PERF_SAMPLE_BRANCH_STACK
-  if (sample_fields & PERF_SAMPLE_BRANCH_STACK) {
-    if (!sample.branch_stack) {
-      LOG(ERROR) << "Expecting branch stack data, but none was found.";
-    } else {
-      *array++ = sample.branch_stack->nr;
-      for (size_t i = 0; i < sample.branch_stack->nr; ++i) {
-        *array++ = sample.branch_stack->entries[i].from;
-        *array++ = sample.branch_stack->entries[i].to;
-        memcpy(array++, &sample.branch_stack->entries[i].flags,
-               sizeof(uint64_t));
-      }
-    }
-  }
-
-  return (array - initial_array_ptr) * sizeof(uint64_t);
+// Returns true if |e1| has an earlier timestamp than |e2|. Used to sort an
+// array of events.
+static bool CompareEventTimes(const PerfEvent* e1, const PerfEvent* e2) {
+  return e1->timestamp() < e2->timestamp();
 }
 
 }  // namespace
 
-PerfReader::~PerfReader() {
-  // Free allocated memory.
-  for (size_t i = 0; i < build_id_events_.size(); ++i)
-    if (build_id_events_[i])
-      free(build_id_events_[i]);
+PerfReader::PerfReader()
+    : proto_(Arena::CreateMessage<PerfDataProto>(&arena_)),
+      is_cross_endian_(false) {
+  // The metadata mask is stored in |proto_|. It should be initialized to 0
+  // since it is used heavily.
+  proto_->add_metadata_mask(0);
 }
 
-void PerfReader::PerfizeBuildIDString(string* build_id) {
-  build_id->resize(kBuildIDStringLength, '0');
+PerfReader::~PerfReader() {}
+
+bool PerfReader::Serialize(PerfDataProto* perf_data_proto) const {
+  perf_data_proto->CopyFrom(*proto_);
+
+  // Add a timestamp_sec to the protobuf.
+  struct timeval timestamp_sec;
+  if (!gettimeofday(&timestamp_sec, NULL))
+    perf_data_proto->set_timestamp_sec(timestamp_sec.tv_sec);
+  return true;
 }
 
-void PerfReader::UnperfizeBuildIDString(string* build_id) {
-  const size_t kPaddingSize = 8;
-  const string kBuildIDPadding = string(kPaddingSize, '0');
+bool PerfReader::Deserialize(const PerfDataProto& perf_data_proto) {
+  proto_->CopyFrom(perf_data_proto);
 
-  // Remove kBuildIDPadding from the end of build_id until we cannot remove any
-  // more, or removing more would cause the build id to be empty.
-  while (build_id->size() > kPaddingSize &&
-         build_id->substr(build_id->size() - kPaddingSize) == kBuildIDPadding) {
-    build_id->resize(build_id->size() - kPaddingSize);
+  // Iterate through all attrs and create a SampleInfoReader for each of them.
+  // This is necessary for writing the proto representation of perf data to raw
+  // data.
+  for (const auto& stored_attr : proto_->file_attrs()) {
+    PerfFileAttr attr;
+    serializer_.DeserializePerfFileAttr(stored_attr, &attr);
+    serializer_.CreateSampleInfoReader(attr, false /* read_cross_endian */);
   }
+  return true;
 }
 
 bool PerfReader::ReadFile(const string& filename) {
-  std::vector<char> data;
-  return ReadFileToData(filename, &data) && ReadFromVector(data);
+  FileReader reader(filename);
+  if (!reader.IsOpen()) {
+    LOG(ERROR) << "Unable to open file " << filename;
+    return false;
+  }
+  return ReadFromData(&reader);
 }
 
 bool PerfReader::ReadFromVector(const std::vector<char>& data) {
@@ -667,7 +254,7 @@ bool PerfReader::ReadFromData(DataReader* data) {
 
   // Check if it is normal perf data.
   if (header_.size == sizeof(header_)) {
-    DLOG(INFO) << "Perf data is in normal format.";
+    DVLOG(1) << "Perf data is in normal format.";
 
     // Make sure sections are within the size of the file. This check prevents
     // more obscure messages later when attempting to read from one of these
@@ -675,27 +262,26 @@ bool PerfReader::ReadFromData(DataReader* data) {
     if (header_.attrs.offset + header_.attrs.size > data->size()) {
       LOG(ERROR) << "Header says attrs section ends at "
                  << header_.attrs.offset + header_.attrs.size
-                 << "bytes, which is larger than perf data size of "
+                 << " bytes, which is larger than perf data size of "
                  << data->size() << " bytes.";
       return false;
     }
     if (header_.data.offset + header_.data.size > data->size()) {
       LOG(ERROR) << "Header says data section ends at "
                  << header_.data.offset + header_.data.size
-                 << "bytes, which is larger than perf data size of "
+                 << " bytes, which is larger than perf data size of "
                  << data->size() << " bytes.";
       return false;
     }
     if (header_.event_types.offset + header_.event_types.size > data->size()) {
       LOG(ERROR) << "Header says event_types section ends at "
                  << header_.event_types.offset + header_.event_types.size
-                 << "bytes, which is larger than perf data size of "
+                 << " bytes, which is larger than perf data size of "
                  << data->size() << " bytes.";
       return false;
     }
 
-    metadata_mask_ = header_.adds_features[0];
-    if (!(metadata_mask_ & (1 << HEADER_EVENT_DESC))) {
+    if (!get_metadata_mask_bit(HEADER_EVENT_DESC)) {
       // Prefer to read attrs and event names from HEADER_EVENT_DESC metadata if
       // available. event_types section of perf.data is obsolete, but use it as
       // a fallback:
@@ -703,12 +289,14 @@ bool PerfReader::ReadFromData(DataReader* data) {
         return false;
     }
 
-    if (!(ReadDataSection(data) && ReadMetadata(data)))
+    if (!(ReadMetadata(data) && ReadDataSection(data)))
       return false;
 
     // We can construct HEADER_EVENT_DESC from attrs and event types.
     // NB: Can't set this before ReadMetadata(), or it may misread the metadata.
-    metadata_mask_ |= (1 << HEADER_EVENT_DESC);
+    if (!event_types().empty())
+      set_metadata_mask_bit(HEADER_EVENT_DESC);
+
     return true;
   }
 
@@ -725,7 +313,7 @@ bool PerfReader::ReadFromData(DataReader* data) {
 
 bool PerfReader::WriteFile(const string& filename) {
   std::vector<char> data;
-  return WriteToVector(&data) && WriteDataToFile(data, filename);
+  return WriteToVector(&data) && BufferToFile(filename, data);
 }
 
 bool PerfReader::WriteToVector(std::vector<char>* data) {
@@ -750,35 +338,36 @@ bool PerfReader::WriteToPointer(char* buffer, size_t size) {
 
 bool PerfReader::WriteToPointerWithoutCheckingSize(char* buffer, size_t size) {
   BufferWriter data(buffer, size);
-  if (!WriteHeader(&data) ||
-      !WriteAttrs(&data) ||
-      !WriteEventTypes(&data) ||
-      !WriteData(&data) ||
-      !WriteMetadata(&data)) {
-    return false;
-  }
-  return true;
+  struct perf_file_header header;
+  GenerateHeader(&header);
+
+  return
+      WriteHeader(header, &data) &&
+      WriteAttrs(header, &data) &&
+      WriteData(header, &data) &&
+      WriteMetadata(header, &data);
 }
 
-size_t PerfReader::GetSize() {
-  // TODO(rohinmshah): This is not a good CHECK.  See TODO in perf_reader.h.
-  CHECK(RegenerateHeader());
+size_t PerfReader::GetSize() const {
+  struct perf_file_header header;
+  GenerateHeader(&header);
 
   size_t total_size = 0;
-  total_size = 0;
-  total_size += out_header_.size;
-  total_size += out_header_.attrs.size;
-  total_size += out_header_.event_types.size;
-  total_size += out_header_.data.size;
+  total_size += header.size;
+  total_size += header.attrs.size;
+  total_size += header.event_types.size;
+  total_size += header.data.size;
   // Add the ID info, whose size is not explicitly included in the header.
-  for (size_t i = 0; i < attrs_.size(); ++i)
-    total_size += attrs_[i].ids.size() * sizeof(attrs_[i].ids[0]);
+  for (const auto& attr : proto_->file_attrs()) {
+    total_size +=
+        attr.ids_size() * sizeof(decltype(PerfFileAttr::ids)::value_type);
+  }
 
   // Additional info about metadata.  See WriteMetadata for explanation.
   total_size += GetNumSupportedMetadata() * sizeof(struct perf_file_section);
 
   // Add the sizes of the various metadata.
-  total_size += tracing_data_.size();
+  total_size += tracing_data().size();
   total_size += GetBuildIDMetadataSize();
   total_size += GetStringMetadataSize();
   total_size += GetUint32MetadataSize();
@@ -789,7 +378,7 @@ size_t PerfReader::GetSize() {
   return total_size;
 }
 
-bool PerfReader::RegenerateHeader() {
+void PerfReader::GenerateHeader(struct perf_file_header* header) const {
   // This is the order of the input perf file contents in normal mode:
   // 1. Header
   // 2. Attribute IDs (pointed to by attr.ids.offset)
@@ -800,29 +389,31 @@ bool PerfReader::RegenerateHeader() {
 
   // Compute offsets in the above order.
   CheckNoEventHeaderPadding();
-  memset(&out_header_, 0, sizeof(out_header_));
-  out_header_.magic = kPerfMagic;
-  out_header_.size = sizeof(out_header_);
-  out_header_.attr_size = sizeof(perf_file_attr);
-  out_header_.attrs.size = out_header_.attr_size * attrs_.size();
-  for (size_t i = 0; i < events_.size(); i++)
-    out_header_.data.size += events_[i]->header.size;
-  out_header_.event_types.size = HaveEventNames() ?
-      (attrs_.size() * sizeof(perf_trace_event_type)) : 0;
+  memset(header, 0, sizeof(*header));
+  header->magic = kPerfMagic;
+  header->size = sizeof(*header);
+  header->attr_size = sizeof(perf_file_attr);
+  header->attrs.size = header->attr_size * attrs().size();
+  for (const PerfEvent& event : proto_->events())
+    header->data.size += event.header().size();
+  // Do not use the event_types section. Use EVENT_DESC metadata instead.
+  header->event_types.size = 0;
 
   u64 current_offset = 0;
-  current_offset += out_header_.size;
-  for (size_t i = 0; i < attrs_.size(); i++)
-    current_offset += sizeof(attrs_[i].ids[0]) * attrs_[i].ids.size();
-  out_header_.attrs.offset = current_offset;
-  current_offset += out_header_.attrs.size;
-  out_header_.event_types.offset = current_offset;
-  current_offset += out_header_.event_types.size;
+  current_offset += header->size;
+  for (const auto& attr : proto_->file_attrs()) {
+    current_offset +=
+        sizeof(decltype(PerfFileAttr::ids)::value_type) * attr.ids_size();
+  }
+  header->attrs.offset = current_offset;
+  current_offset += header->attrs.size;
+  header->event_types.offset = current_offset;
+  current_offset += header->event_types.size;
 
-  out_header_.data.offset = current_offset;
+  header->data.offset = current_offset;
 
   // Construct the header feature bits.
-  memset(&out_header_.adds_features, 0, sizeof(out_header_.adds_features));
+  memset(&header->adds_features, 0, sizeof(header->adds_features));
   // The following code makes the assumption that all feature bits are in the
   // first word of |adds_features|.  If the perf data format changes and the
   // assumption is no longer valid, this CHECK will fail, at which point the
@@ -831,40 +422,43 @@ bool PerfReader::RegenerateHeader() {
   // This assumption is also used when reading metadata, so that code
   // will also have to be updated if this CHECK starts to fail.
   CHECK_LE(static_cast<size_t>(HEADER_LAST_FEATURE),
-           BytesToBits(sizeof(out_header_.adds_features[0])));
-  out_header_.adds_features[0] |= metadata_mask_ & kSupportedMetadataMask;
-
-  return true;
+           BytesToBits(sizeof(header->adds_features[0])));
+  header->adds_features[0] |= metadata_mask() & kSupportedMetadataMask;
 }
 
 bool PerfReader::InjectBuildIDs(
     const std::map<string, string>& filenames_to_build_ids) {
-  metadata_mask_ |= (1 << HEADER_BUILD_ID);
+  set_metadata_mask_bit(HEADER_BUILD_ID);
   std::set<string> updated_filenames;
   // Inject new build ID's for existing build ID events.
-  for (size_t i = 0; i < build_id_events_.size(); ++i) {
-    build_id_event* event = build_id_events_[i];
-    string filename = event->filename;
-    if (filenames_to_build_ids.find(filename) == filenames_to_build_ids.end())
+  for (auto& build_id : *proto_->mutable_build_ids()) {
+    auto find_result = filenames_to_build_ids.find(build_id.filename());
+    if (find_result == filenames_to_build_ids.end())
       continue;
+    const string& build_id_string = find_result->second;
+    const int kHexCharsPerByte = 2;
+    std::vector<uint8_t>
+        build_id_data(build_id_string.size() / kHexCharsPerByte);
+    if (!HexStringToRawData(build_id_string, build_id_data.data(),
+                            build_id_data.size())) {
+      LOG(ERROR) << "Could not convert hex string to raw data: "
+                 << build_id_string;
+      return false;
+    }
+    build_id.set_build_id_hash(build_id_data.data(), build_id_data.size());
 
-    string build_id = filenames_to_build_ids.at(filename);
-    PerfizeBuildIDString(&build_id);
-    // Changing a build id should always result in an update, never creation.
-    CHECK_EQ(event, CreateOrUpdateBuildID(build_id, "", 0, event));
-    updated_filenames.insert(filename);
+    updated_filenames.insert(build_id.filename());
   }
 
   // For files with no existing build ID events, create new build ID events.
   // This requires a lookup of all MMAP's to determine the |misc| field of each
   // build ID event.
   std::map<string, uint16_t> filename_to_misc;
-  for (size_t i = 0; i < events_.size(); ++i) {
-    const event_t& event = *events_[i];
-    if (event.header.type == PERF_RECORD_MMAP)
-      filename_to_misc[event.mmap.filename] = event.header.misc;
-    if (event.header.type == PERF_RECORD_MMAP2)
-      filename_to_misc[event.mmap2.filename] = event.header.misc;
+  for (const PerfEvent& event : proto_->events()) {
+    if (event.header().type() == PERF_RECORD_MMAP ||
+        event.header().type() == PERF_RECORD_MMAP2) {
+      filename_to_misc[event.mmap_event().filename()] = event.header().misc();
+    }
   }
 
   std::map<string, string>::const_iterator it;
@@ -883,61 +477,38 @@ bool PerfReader::InjectBuildIDs(
       new_misc = misc_iter->second;
 
     string build_id = it->second;
-    PerfizeBuildIDString(&build_id);
-    build_id_event* event =
-        CreateOrUpdateBuildID(build_id, filename, new_misc, NULL);
-    CHECK(event);
-    build_id_events_.push_back(event);
+    malloced_unique_ptr<build_id_event> event =
+        CreateBuildIDEvent(build_id, filename, new_misc);
+    if (!serializer_.SerializeBuildIDEvent(event, proto_->add_build_ids())) {
+      LOG(ERROR) << "Could not serialize build ID event with ID " << build_id;
+      return false;
+    }
   }
-
   return true;
 }
 
 bool PerfReader::Localize(
     const std::map<string, string>& build_ids_to_filenames) {
-  std::map<string, string> perfized_build_ids_to_filenames;
-  std::map<string, string>::const_iterator it;
-  for (it = build_ids_to_filenames.begin();
-       it != build_ids_to_filenames.end();
-       ++it) {
-    string build_id = it->first;
-    PerfizeBuildIDString(&build_id);
-    perfized_build_ids_to_filenames[build_id] = it->second;
-  }
-
   std::map<string, string> filename_map;
-  for (size_t i = 0; i < build_id_events_.size(); ++i) {
-    build_id_event* event = build_id_events_[i];
-    string build_id = HexToString(event->build_id, kBuildIDArraySize);
-    if (perfized_build_ids_to_filenames.find(build_id) ==
-        perfized_build_ids_to_filenames.end()) {
+  for (auto& build_id : *proto_->mutable_build_ids()) {
+    string build_id_string = RawDataToHexString(build_id.build_id_hash());
+    auto find_result = build_ids_to_filenames.find(build_id_string);
+    if (find_result == build_ids_to_filenames.end())
       continue;
-    }
-
-    string new_name = perfized_build_ids_to_filenames.at(build_id);
-    filename_map[string(event->filename)] = new_name;
-    build_id_event* new_event = CreateOrUpdateBuildID("", new_name, 0, event);
-    CHECK(new_event);
-    build_id_events_[i] = new_event;
+    const string& new_filename = find_result->second;
+    filename_map[build_id.filename()] = new_filename;
   }
 
-  LocalizeUsingFilenames(filename_map);
-  return true;
+  return LocalizeUsingFilenames(filename_map);
 }
 
 bool PerfReader::LocalizeUsingFilenames(
     const std::map<string, string>& filename_map) {
   LocalizeMMapFilenames(filename_map);
-  for (size_t i = 0; i < build_id_events_.size(); ++i) {
-    build_id_event* event = build_id_events_[i];
-    string old_name = event->filename;
-
-    if (filename_map.find(event->filename) != filename_map.end()) {
-      const string& new_name = filename_map.at(old_name);
-      build_id_event* new_event = CreateOrUpdateBuildID("", new_name, 0, event);
-      CHECK(new_event);
-      build_id_events_[i] = new_event;
-    }
+  for (auto& build_id : *proto_->mutable_build_ids()) {
+    auto find_result = filename_map.find(build_id.filename());
+    if (find_result != filename_map.end())
+      build_id.set_filename(find_result->second);
   }
   return true;
 }
@@ -952,98 +523,39 @@ void PerfReader::GetFilenames(std::vector<string>* filenames) const {
 
 void PerfReader::GetFilenamesAsSet(std::set<string>* filenames) const {
   filenames->clear();
-  for (size_t i = 0; i < events_.size(); ++i) {
-    const event_t& event = *events_[i];
-    if (event.header.type == PERF_RECORD_MMAP)
-      filenames->insert(event.mmap.filename);
-    if (event.header.type == PERF_RECORD_MMAP2)
-      filenames->insert(event.mmap2.filename);
+  for (const PerfEvent& event : proto_->events()) {
+    if (event.header().type() == PERF_RECORD_MMAP ||
+        event.header().type() == PERF_RECORD_MMAP2) {
+      filenames->insert(event.mmap_event().filename());
+    }
   }
 }
 
 void PerfReader::GetFilenamesToBuildIDs(
     std::map<string, string>* filenames_to_build_ids) const {
   filenames_to_build_ids->clear();
-  for (size_t i = 0; i < build_id_events_.size(); ++i) {
-    const build_id_event& event = *build_id_events_[i];
-    string build_id = HexToString(event.build_id, kBuildIDArraySize);
-    (*filenames_to_build_ids)[event.filename] = build_id;
+  for (const auto& build_id : proto_->build_ids()) {
+    string build_id_string = RawDataToHexString(build_id.build_id_hash());
+    PerfizeBuildIDString(&build_id_string);
+    (*filenames_to_build_ids)[build_id.filename()] = build_id_string;
   }
 }
 
-bool PerfReader::IsSupportedEventType(uint32_t type) {
-  switch (type) {
-  case PERF_RECORD_SAMPLE:
-  case PERF_RECORD_MMAP:
-  case PERF_RECORD_MMAP2:
-  case PERF_RECORD_FORK:
-  case PERF_RECORD_EXIT:
-  case PERF_RECORD_COMM:
-  case PERF_RECORD_LOST:
-  case PERF_RECORD_THROTTLE:
-  case PERF_RECORD_UNTHROTTLE:
-    return true;
-  default:
-    return false;
-  }
-}
-
-bool PerfReader::ReadPerfSampleInfo(const event_t& event,
-                                    struct perf_sample* sample) const {
-  CHECK(sample);
-
-  if (!IsSupportedEventType(event.header.type)) {
-    LOG(ERROR) << "Unsupported event type " << event.header.type;
-    return false;
+void PerfReader::MaybeSortEventsByTime() {
+  // Events can not be sorted by time if PERF_SAMPLE_TIME is not set in
+  // attr.sample_type for all attrs.
+  for (const auto& attr : attrs()) {
+    if (!(attr.attr().sample_type() & PERF_SAMPLE_TIME)) {
+      return;
+    }
   }
 
-  uint64_t sample_format = GetSampleFieldsForEventType(event.header.type,
-                                                       sample_type_);
-  uint64_t offset = GetPerfSampleDataOffset(event);
-  size_t size_read = ReadPerfSampleFromData(
-      static_cast<perf_event_type>(event.header.type),
-      reinterpret_cast<const uint64_t*>(&event) + offset / sizeof(uint64_t),
-      sample_format,
-      read_format_,
-      is_cross_endian_,
-      sample);
+  // Sort the events based on timestamp.
 
-  size_t expected_size = event.header.size - offset;
-  if (size_read != expected_size) {
-    LOG(ERROR) << "Read " << size_read << " bytes, expected "
-               << expected_size << " bytes.";
-  }
-
-  return (size_read == expected_size);
-}
-
-bool PerfReader::WritePerfSampleInfo(const perf_sample& sample,
-                                     event_t* event) const {
-  CHECK(event);
-
-  if (!IsSupportedEventType(event->header.type)) {
-    LOG(ERROR) << "Unsupported event type " << event->header.type;
-    return false;
-  }
-
-  uint64_t sample_format = GetSampleFieldsForEventType(event->header.type,
-                                                       sample_type_);
-  uint64_t offset = GetPerfSampleDataOffset(*event);
-
-  size_t expected_size = event->header.size - offset;
-  memset(reinterpret_cast<uint8_t*>(event) + offset, 0, expected_size);
-  size_t size_written = WritePerfSampleToData(
-      static_cast<perf_event_type>(event->header.type),
-      sample,
-      sample_format,
-      read_format_,
-      reinterpret_cast<uint64_t*>(event) + offset / sizeof(uint64_t));
-  if (size_written != expected_size) {
-    LOG(ERROR) << "Wrote " << size_written << " bytes, expected "
-               << expected_size << " bytes.";
-  }
-
-  return (size_written == expected_size);
+  // This sorts the pointers in the proto-internal vector, which
+  // requires no copying and less external space.
+  std::stable_sort(proto_->mutable_events()->pointer_begin(),
+                   proto_->mutable_events()->pointer_end(), CompareEventTimes);
 }
 
 bool PerfReader::ReadHeader(DataReader* data) {
@@ -1052,10 +564,11 @@ bool PerfReader::ReadHeader(DataReader* data) {
   // doesn't make sense for piped files. Instead, verify that the reader points
   // to the start of the data.
   CHECK_EQ(0U, data->Tell());
-  if (!data->ReadDataValue(sizeof(piped_header_), "header magic",
-                           &piped_header_)) {
+  if (!data->ReadUint64(&piped_header_.magic)) {
+    LOG(ERROR) << "Error reading header magic number.";
     return false;
   }
+
   if (piped_header_.magic != kPerfMagic &&
       piped_header_.magic != bswap_64(kPerfMagic)) {
     LOG(ERROR) << "Read wrong magic. Expected: 0x" << std::hex << kPerfMagic
@@ -1064,25 +577,86 @@ bool PerfReader::ReadHeader(DataReader* data) {
     return false;
   }
   is_cross_endian_ = (piped_header_.magic != kPerfMagic);
-  if (is_cross_endian_)
-    ByteSwap(&piped_header_.size);
+  data->set_is_cross_endian(is_cross_endian_);
+
+  if (!data->ReadUint64(&piped_header_.size)) {
+    LOG(ERROR) << "Error reading header size.";
+    return false;
+  }
+
+  CHECK_EQ(data->Tell(), sizeof(piped_header_));
 
   // Header can be a piped header.
   if (piped_header_.size == sizeof(piped_header_))
     return true;
 
-  // Re-read full header
-  data->SeekSet(0);
-  if (!data->ReadDataValue(sizeof(header_), "header data", &header_))
+  // Read as a non-piped header.
+  if (!data->ReadUint64(&header_.attr_size)) {
+    LOG(ERROR) << "Error reading header::attr_size.";
     return false;
-  if (is_cross_endian_)
-    ByteSwap(&header_.size);
+  }
+  if (!ReadPerfFileSection(data, &header_.attrs) ||
+      !ReadPerfFileSection(data, &header_.data) ||
+      !ReadPerfFileSection(data, &header_.event_types)) {
+    LOG(ERROR) << "Error reading header file section info.";
+    return false;
+  }
+
+  const size_t features_size = sizeof(header_.adds_features);
+  CHECK_EQ(data->Tell(), sizeof(header_) - features_size);
+
+  if (!data->ReadData(features_size, header_.adds_features)) {
+    LOG(ERROR) << "Error reading header::adds_features.";
+    return false;
+  }
+  proto_->set_metadata_mask(0, header_.adds_features[0]);
+
+  // Byte-swapping |adds_features| is tricky. It is defined as an array of
+  // unsigned longs, which can vary between architectures. However, the overall
+  // size of the array in bytes is fixed.
+  //
+  // According to perf's perf_file_header__read() function, the hostname feature
+  // should always be set. Try byte-swapping as uint64s first and check the
+  // hostname bit. If it's not set, then try swapping as uint32s. This is
+  // similar to the algorithm used in perf.
+  if (data->is_cross_endian()) {
+    static_assert(sizeof(header_.adds_features[0]) == sizeof(uint32_t) ||
+                  sizeof(header_.adds_features[0]) == sizeof(uint64_t),
+                  "|header_.adds_features| must be defined as an array of "
+                  "either 32-bit or 64-bit words.");
+
+    uint64_t features64 = 0;
+    // Some compilers will complain if we directly cast |header_.adds_features|
+    // to a uint64_t*. Instead, determine the first uint64_t without using
+    // pointer aliasing.
+    if (sizeof(header_.adds_features[0]) == sizeof(uint64_t)) {
+      features64 = bswap_64(header_.adds_features[0]);
+    } else {
+      // If the native |adds_features| is composed of 32-bit words, swap the
+      // byte order of each word and then swap their positions to create a
+      // 64-bit word.
+      features64 =
+          static_cast<uint64_t>(bswap_32(header_.adds_features[0])) << 32;
+      features64 |= bswap_32(header_.adds_features[1]);
+    }
+    if (features64 & (1 << HEADER_HOSTNAME)) {
+      for (size_t i = 0; i < features_size / sizeof(uint64_t); ++i)
+        ByteSwap(reinterpret_cast<uint64_t*>(header_.adds_features) + i);
+    } else {
+      for (size_t i = 0; i < features_size / sizeof(uint32_t); ++i)
+        ByteSwap(reinterpret_cast<uint32_t*>(header_.adds_features) + i);
+    }
+  }
 
   return true;
 }
 
 bool PerfReader::ReadAttrsSection(DataReader* data) {
   size_t num_attrs = header_.attrs.size / header_.attr_size;
+  if (header_.attrs.size % header_.attr_size != 0) {
+    LOG(ERROR) << "Total size of attrs " << header_.attrs.size
+               << " is not a multiple of attr size " << header_.attr_size;
+  }
   data->SeekSet(header_.attrs.offset);
   for (size_t i = 0; i < num_attrs; i++) {
     if (!ReadAttr(data))
@@ -1097,23 +671,20 @@ bool PerfReader::ReadAttr(DataReader* data) {
     return false;
 
   perf_file_section ids;
-  if (!data->ReadDataValue(sizeof(ids), "ID section info", &ids))
+  if (!ReadPerfFileSection(data, &ids))
     return false;
-  if (is_cross_endian_) {
-    ByteSwap(&ids.offset);
-    ByteSwap(&ids.size);
-  }
-
-  size_t num_ids = ids.size / sizeof(decltype(attr.ids)::value_type);
 
   // The ID may be stored at a different location in the file than where we're
   // currently reading.
   size_t saved_offset = data->Tell();
   data->SeekSet(ids.offset);
+
+  size_t num_ids = ids.size / sizeof(decltype(attr.ids)::value_type);
   if (!ReadUniqueIDs(data, num_ids, &attr.ids))
     return false;
   data->SeekSet(saved_offset);
-  attrs_.push_back(attr);
+  AddPerfFileAttr(attr);
+
   return true;
 }
 
@@ -1125,14 +696,10 @@ bool PerfReader::ReadEventAttr(DataReader* data, perf_event_attr* attr) {
       offsetof(struct perf_event_attr, size) == sizeof(perf_event_attr::type),
       "type and size should be the first to fields of perf_event_attr");
 
-  if (!data->ReadDataValue(sizeof(perf_event_attr::type), "attr.type",
-                           &attr->type) ||
-      !data->ReadDataValue(sizeof(perf_event_attr::size), "attr.size",
-                           &attr->size)) {
+  if (!data->ReadUint32(&attr->type) || !data->ReadUint32(&attr->size)) {
+    LOG(ERROR) << "Error reading event attr type and size.";
     return false;
   }
-  attr->type = MaybeSwap(attr->type, is_cross_endian_);
-  attr->size = MaybeSwap(attr->size, is_cross_endian_);
 
   // Now read the rest of the attr struct.
   const size_t attr_offset = sizeof(attr->type) + sizeof(attr->size);
@@ -1144,7 +711,7 @@ bool PerfReader::ReadEventAttr(DataReader* data, perf_event_attr* attr) {
   }
   data->SeekSet(data->Tell() + attr->size - attr_readable_size);
 
-  if (is_cross_endian_) {
+  if (data->is_cross_endian()) {
     // Depending on attr->size, some of these might not have actually been
     // read. This is okay: they are zero.
     ByteSwap(&attr->type);
@@ -1156,8 +723,7 @@ bool PerfReader::ReadEventAttr(DataReader* data, perf_event_attr* attr) {
 
     // NB: This will also reverse precise_ip : 2 as if it was two fields:
     auto *const bitfield_start = &attr->read_format + 1;
-    SwapBitfieldOfBits(reinterpret_cast<u8*>(bitfield_start),
-                       sizeof(u64));
+    SwapBitfieldOfBits(reinterpret_cast<u8*>(bitfield_start), sizeof(u64));
     // ... So swap it back:
     const auto tmp = attr->precise_ip;
     attr->precise_ip = (tmp & 0x2) >> 1 | (tmp & 0x1) << 1;
@@ -1175,89 +741,75 @@ bool PerfReader::ReadEventAttr(DataReader* data, perf_event_attr* attr) {
   // the struct definition.  Check against perf_event_attr's |size| field.
   attr->size = sizeof(*attr);
 
-  // Assign sample type if it hasn't been assigned, otherwise make sure all
-  // subsequent attributes have the same sample type bits set.
-  if (sample_type_ == 0) {
-    sample_type_ = attr->sample_type;
-  } else {
-    CHECK_EQ(sample_type_, attr->sample_type)
-        << "Event type sample format does not match sample format of other "
-        << "event type.";
-  }
-
-  if (read_format_ == 0) {
-    read_format_ = attr->read_format;
-  } else {
-    CHECK_EQ(read_format_, attr->read_format)
-        << "Event type read format does not match read format of other event "
-        << "types.";
-  }
-
   return true;
 }
 
 bool PerfReader::ReadUniqueIDs(DataReader* data, size_t num_ids,
                                std::vector<u64>* ids) {
   ids->resize(num_ids);
-  for (size_t j = 0; j < num_ids; j++) {
-    if (!data->ReadDataValue(sizeof(ids->at(j)), "ID", &ids->at(j)))
+  for (u64& id : *ids) {
+    if (!data->ReadUint64(&id)) {
+      LOG(ERROR) << "Error reading unique ID.";
       return false;
-    if (is_cross_endian_)
-      ByteSwap(&ids->at(j));
+    }
   }
   return true;
 }
 
 bool PerfReader::ReadEventTypesSection(DataReader* data) {
-  size_t num_event_types = header_.event_types.size /
-      sizeof(struct perf_trace_event_type);
+  int num_event_types =
+      header_.event_types.size / sizeof(struct perf_trace_event_type);
   if (num_event_types == 0) {
     // Not available.
     return true;
   }
-  CHECK_EQ(attrs_.size(), num_event_types);
+  CHECK_EQ(proto_->file_attrs().size(), num_event_types);
   CHECK_EQ(sizeof(perf_trace_event_type) * num_event_types,
            header_.event_types.size);
   data->SeekSet(header_.event_types.offset);
-  for (size_t i = 0; i < num_event_types; ++i) {
+  for (int i = 0; i < num_event_types; ++i) {
     if (!ReadEventType(data, i, 0))
       return false;
   }
   return true;
 }
 
-bool PerfReader::ReadEventType(DataReader* data,
-                               size_t attr_idx, size_t event_size) {
+bool PerfReader::ReadEventType(DataReader* data, int attr_idx,
+                               size_t event_size) {
   CheckNoEventTypePadding();
   decltype(perf_trace_event_type::event_id) event_id;
 
-  if (!data->ReadDataValue(sizeof(event_id), "event id", &event_id))
+  if (!data->ReadUint64(&event_id)) {
+    LOG(ERROR) << "Error reading event ID.";
     return false;
+  }
 
   size_t event_name_len;
   if (event_size == 0) {  // Not in an event.
     event_name_len = sizeof(perf_trace_event_type::name);
   } else {
-    event_name_len =
-        event_size - sizeof(perf_event_header) - sizeof(event_id);
+    event_name_len = event_size - sizeof(perf_event_header) - sizeof(event_id);
   }
-  string event_name;
-  if (!data->ReadString(event_name_len, &event_name)) {
+
+  PerfFileAttr attr;
+  if (!data->ReadString(event_name_len, &attr.name)) {
     LOG(ERROR) << "Not enough data left in data to read event name.";
     return false;
   }
 
-  if (attr_idx >= attrs_.size()) {
+  if (attr_idx >= proto_->file_attrs().size()) {
     LOG(ERROR) << "Too many event types, or attrs not read yet!";
     return false;
   }
-  if (event_id != attrs_[attr_idx].attr.config) {
-    LOG(ERROR) << "event_id for perf_trace_event_type does not match "
-                  "attr.config";
+  if (event_id != proto_->file_attrs(attr_idx).attr().config()) {
+    LOG(ERROR) << "event_id for perf_trace_event_type (" << event_id << ") "
+               << "does not match attr.config ("
+               << proto_->file_attrs(attr_idx).attr().config() << ")";
     return false;
   }
-  attrs_[attr_idx].name = event_name;
+  attr.attr.config = proto_->file_attrs(attr_idx).attr().config();
 
+  serializer_.SerializePerfEventType(attr, proto_->add_event_types());
   return true;
 }
 
@@ -1265,33 +817,34 @@ bool PerfReader::ReadDataSection(DataReader* data) {
   u64 data_remaining_bytes = header_.data.size;
   data->SeekSet(header_.data.offset);
   while (data_remaining_bytes != 0) {
-    perf_event_header header;
-
     // Read the header to determine the size of the event.
-    if (!data->ReadDataValue(sizeof(header), "event header", &header))
+    perf_event_header header;
+    if (!ReadPerfEventHeader(data, &header)) {
+      LOG(ERROR) << "Error reading event header from data section.";
       return false;
-    if (is_cross_endian_) {
-      ByteSwap(&header.type);
-      ByteSwap(&header.misc);
-      ByteSwap(&header.size);
     }
-
-    // Allocate memory for event and copy over the header.
-    malloced_unique_ptr<event_t> event(CallocMemoryForEvent(header.size));
-    event->header = header;
 
     // Read the rest of the event data.
-    if (!data->ReadDataValue(header.size - sizeof(header), "rest of event",
-                             &event->header + 1)) {
+    malloced_unique_ptr<event_t> event(CallocMemoryForEvent(header.size));
+    event->header = header;
+    if (!data->ReadDataValue(event->header.size - sizeof(event->header),
+                             "rest of event", &event->header + 1)) {
       return false;
     }
-    MaybeSwapEventFields(event.get());
-    events_.push_back(std::move(event));
+    MaybeSwapEventFields(event.get(), data->is_cross_endian());
 
-    data_remaining_bytes -= header.size;
+    // We must have a valid way to read sample info before reading perf events.
+    CHECK(serializer_.SampleInfoReaderAvailable());
+
+    // Serialize the event to protobuf form.
+    PerfEvent* proto_event = proto_->add_events();
+    if (!serializer_.SerializeEvent(event, proto_event))
+      return false;
+
+    data_remaining_bytes -= event->header.size;
   }
 
-  DLOG(INFO) << "Number of events stored: "<< events_.size();
+  DLOG(INFO) << "Number of events stored: " << proto_->events_size();
   return true;
 }
 
@@ -1303,20 +856,17 @@ bool PerfReader::ReadMetadata(DataReader* data) {
   // takes into account all present metadata types, not just the ones included
   // in |kSupportedMetadataMask|. If a metadata type is not supported, it is
   // skipped over.
-  std::vector<struct perf_file_section> sections(GetNumBits(metadata_mask_));
-  if (!data->ReadDataValue(sections.size() * sizeof(struct perf_file_section),
-                           "feature metadata index", sections.data())) {
-    return false;
-  }
-  if (is_cross_endian_) {
-    for (auto& section : sections) {
-      ByteSwap(&section.offset);
-      ByteSwap(&section.size);
+  std::vector<struct perf_file_section> sections(GetNumBits(metadata_mask()));
+  for (struct perf_file_section& section : sections) {
+    if (!ReadPerfFileSection(data, &section)) {
+      LOG(ERROR) << "Error reading metadata entry info.";
+      return false;
     }
   }
+
   auto section_iter = sections.begin();
   for (u32 type = HEADER_FIRST_FEATURE; type != HEADER_LAST_FEATURE; ++type) {
-    if ((metadata_mask_ & (1 << type)) == 0)
+    if (!get_metadata_mask_bit(type))
       continue;
     data->SeekSet(section_iter->offset);
     u64 size = section_iter->size;
@@ -1331,15 +881,58 @@ bool PerfReader::ReadMetadata(DataReader* data) {
         return false;
       break;
     case HEADER_HOSTNAME:
-    case HEADER_OSRELEASE:
-    case HEADER_VERSION:
-    case HEADER_ARCH:
-    case HEADER_CPUDESC:
-    case HEADER_CPUID:
-    case HEADER_CMDLINE:
-      if (!ReadStringMetadata(data, type, size))
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_hostname())) {
         return false;
+      }
       break;
+    case HEADER_OSRELEASE:
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_kernel_version())) {
+        return false;
+      }
+      break;
+    case HEADER_VERSION:
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_perf_version())) {
+        return false;
+      }
+      break;
+    case HEADER_ARCH:
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_architecture())) {
+        return false;
+      }
+      break;
+    case HEADER_CPUDESC:
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_cpu_description())) {
+        return false;
+      }
+      break;
+    case HEADER_CPUID:
+      if (!ReadSingleStringMetadata(
+              data, size,
+              proto_->mutable_string_metadata()->mutable_cpu_id())) {
+        return false;
+      }
+      break;
+    case HEADER_CMDLINE:
+    {
+      auto* string_metadata = proto_->mutable_string_metadata();
+      if (!ReadRepeatedStringMetadata(
+              data, size,
+              string_metadata->mutable_perf_command_line_token(),
+              string_metadata->mutable_perf_command_line_whole())) {
+        return false;
+      }
+      break;
+    }
     case HEADER_NRCPUS:
       if (!ReadUint32Metadata(data, type, size))
         return false;
@@ -1377,14 +970,9 @@ bool PerfReader::ReadBuildIDMetadata(DataReader* data, size_t size) {
   while (size > 0) {
     // Make sure there is enough data for everything but the filename.
     perf_event_header build_id_header;
-    if (!data->ReadDataValue(sizeof(build_id_header), "build ID header",
-                             &build_id_header)) {
+    if (!ReadPerfEventHeader(data, &build_id_header)) {
+      LOG(ERROR) << "Error reading build ID header.";
       return false;
-    }
-    if (is_cross_endian_) {
-      ByteSwap(&build_id_header.type);
-      ByteSwap(&build_id_header.misc);
-      ByteSwap(&build_id_header.size);
     }
 
     if (!ReadBuildIDMetadataWithoutHeader(data, build_id_header))
@@ -1408,39 +996,65 @@ bool PerfReader::ReadBuildIDMetadataWithoutHeader(
     LOG(ERROR) << "Not enough bytes to read build id event";
     return false;
   }
-  if (is_cross_endian_)
+  if (data->is_cross_endian())
     ByteSwap(&event->pid);
 
   // Perf tends to use more space than necessary, so fix the size.
   event->header.size =
       sizeof(*event) + GetUint64AlignedStringLength(event->filename);
-  // TODO(sque): Convert |build_id_events_| to a vector of
-  // malloced_unique_ptrs, so this can be done using std::move().
-  build_id_events_.push_back(event.release());
+
+  if (!serializer_.SerializeBuildIDEvent(event, proto_->add_build_ids())) {
+    LOG(ERROR) << "Could not serialize build ID event with ID "
+               << RawDataToHexString(event->build_id, sizeof(event->build_id));
+    return false;
+  }
   return true;
 }
 
-bool PerfReader::ReadStringMetadata(DataReader* data, u32 type, size_t size) {
-  PerfStringMetadata str_data;
-  str_data.type = type;
+bool PerfReader::ReadSingleStringMetadata(
+    DataReader* data,
+    size_t max_readable_size,
+    StringAndMd5sumPrefix* dest) const {
+  // If a string metadata field is present but empty, it can have a size of 0,
+  // in which case there is nothing to be read.
+  string single_string;
+  if (max_readable_size && !data->ReadStringWithSizeFromData(&single_string))
+    return false;
+  dest->set_value(single_string);
+  dest->set_value_md5_prefix(Md5Prefix(single_string));
+  return true;
+}
 
-  // Skip the number of string data if it is present.
-  if (NeedsNumberOfStringData(type)) {
-    num_string_data_type count;
-    if (!data->ReadDataValue(sizeof(count), "string count", &count))
+bool PerfReader::ReadRepeatedStringMetadata(
+    DataReader* data,
+    size_t max_readable_size,
+    RepeatedPtrField<StringAndMd5sumPrefix>* dest_array,
+    StringAndMd5sumPrefix* dest_single) const {
+  num_string_data_type count = 1;
+  if (!data->ReadUint32(&count)) {
+    LOG(ERROR) << "Error reading string count.";
+    return false;
+  }
+  size_t size_read = sizeof(count);
+
+  string full_string;
+  while (count-- > 0 && size_read < max_readable_size) {
+    StringAndMd5sumPrefix* new_entry = dest_array->Add();
+    size_t offset = data->Tell();
+    if (!ReadSingleStringMetadata(data, max_readable_size - size_read,
+                                  new_entry)) {
       return false;
-    size -= sizeof(count);
+    }
+
+    if (!full_string.empty())
+      full_string += " ";
+    full_string += new_entry->value();
+
+    size_read += data->Tell() - offset;
   }
 
-  while (size > 0) {
-    CStringWithLength single_string;
-    if (!ReadStringFromBuffer(data, is_cross_endian_, &single_string))
-      return false;
-    str_data.data.push_back(single_string);
-    size -= (sizeof(single_string.len) + single_string.len);
-  }
-
-  string_metadata_.push_back(str_data);
+  dest_single->set_value(full_string);
+  dest_single->set_value_md5_prefix(Md5Prefix(full_string));
   return true;
 }
 
@@ -1450,17 +1064,17 @@ bool PerfReader::ReadUint32Metadata(DataReader* data, u32 type, size_t size) {
 
   while (size > 0) {
     uint32_t item;
-    if (!data->ReadDataValue(sizeof(item), "uint32_t data", &item))
+    if (!data->ReadUint32(&item)) {
+      LOG(ERROR) << "Error reading uint32 metadata";
       return false;
-
-    if (is_cross_endian_)
-      ByteSwap(&item);
+    }
 
     uint32_data.data.push_back(item);
     size -= sizeof(item);
   }
 
-  uint32_metadata_.push_back(uint32_data);
+  serializer_.SerializeSingleUint32Metadata(uint32_data,
+                                            proto_->add_uint32_metadata());
   return true;
 }
 
@@ -1470,21 +1084,19 @@ bool PerfReader::ReadUint64Metadata(DataReader* data, u32 type, size_t size) {
 
   while (size > 0) {
     uint64_t item;
-    if (!data->ReadDataValue(sizeof(item), "uint64_t data", &item))
+    if (!data->ReadUint64(&item)) {
+      LOG(ERROR) << "Error reading uint64 metadata";
       return false;
-
-    if (is_cross_endian_)
-      ByteSwap(&item);
+    }
 
     uint64_data.data.push_back(item);
     size -= sizeof(item);
   }
 
-  uint64_metadata_.push_back(uint64_data);
+  serializer_.SerializeSingleUint64Metadata(uint64_data,
+                                            proto_->add_uint64_metadata());
   return true;
 }
-
-// TODO(cwp-team): Move this to match the order in the header file.
 bool PerfReader::ReadEventDescMetadata(DataReader* data, u32 type,
                                        size_t size) {
   // Structure:
@@ -1497,45 +1109,47 @@ bool PerfReader::ReadEventDescMetadata(DataReader* data, u32 type,
   //   u64 ids[nr_ids]
 
   u32 nr_events;
-  if (!data->ReadDataValue(sizeof(nr_events), "event_desc nr_events",
-                           &nr_events)) {
+  if (!data->ReadUint32(&nr_events)) {
+    LOG(ERROR) << "Error reading event_desc nr_events.";
     return false;
   }
 
   u32 attr_size;
-  if (!data->ReadDataValue(sizeof(attr_size), "event_desc attr_size",
-                           &attr_size)) {
+  if (!data->ReadUint32(&attr_size)) {
+    LOG(ERROR) << "Error reading event_desc attr_size.";
     return false;
   }
 
-  attrs_.clear();
-  attrs_.resize(nr_events);
+  file_attrs_seen_.clear();
+  proto_->clear_file_attrs();
+  proto_->mutable_file_attrs()->Reserve(nr_events);
 
   for (u32 i = 0; i < nr_events; i++) {
-    if (!ReadEventAttr(data, &attrs_[i].attr))
+    PerfFileAttr attr;
+    if (!ReadEventAttr(data, &attr.attr))
       return false;
 
     u32 nr_ids;
-    if (!data->ReadDataValue(sizeof(nr_ids), "event_desc nr_ids",
-                             &nr_ids)) {
+    if (!data->ReadUint32(&nr_ids)) {
+      LOG(ERROR) << "Error reading event_desc nr_ids.";
       return false;
     }
 
-    CStringWithLength event_name;
-    if (!ReadStringFromBuffer(data, is_cross_endian_, &event_name))
+    if (!data->ReadStringWithSizeFromData(&attr.name))
       return false;
-    attrs_[i].name = event_name.str;
-
-    std::vector<u64> &ids = attrs_[i].ids;
+    std::vector<u64> &ids = attr.ids;
     ids.resize(nr_ids);
-    size_t sizeof_ids = sizeof(ids[0]) * ids.size();
-    if (!data->ReadDataValue(sizeof_ids, "event_desc ids", ids.data()))
-      return false;
-    if (is_cross_endian_) {
-      for (auto &id : attrs_[i].ids) {
-        ByteSwap(&id);
+    for (u64& id : ids) {
+      if (!data->ReadUint64(&id)) {
+        LOG(ERROR) << "Error reading ID value for attr #" << i;
+        return false;
       }
     }
+    AddPerfFileAttr(attr);
+    // The EVENT_DESC metadata is the newer replacement for the older event type
+    // fields. In the protobuf, both types of data are stored in the
+    // |event_types| field.
+    serializer_.SerializePerfEventType(attr, proto_->add_event_types());
   }
   return true;
 }
@@ -1543,94 +1157,81 @@ bool PerfReader::ReadEventDescMetadata(DataReader* data, u32 type,
 bool PerfReader::ReadCPUTopologyMetadata(DataReader* data, u32 type,
                                          size_t size) {
   num_siblings_type num_core_siblings;
-  if (!data->ReadDataValue(sizeof(num_core_siblings), "num cores",
-                           &num_core_siblings)) {
+  if (!data->ReadUint32(&num_core_siblings)) {
+    LOG(ERROR) << "Error reading num core siblings.";
     return false;
   }
-  if (is_cross_endian_)
-    ByteSwap(&num_core_siblings);
 
-  cpu_topology_.core_siblings.resize(num_core_siblings);
+  PerfCPUTopologyMetadata cpu_topology;
+  cpu_topology.core_siblings.resize(num_core_siblings);
   for (size_t i = 0; i < num_core_siblings; ++i) {
-    if (!ReadStringFromBuffer(data, is_cross_endian_,
-                              &cpu_topology_.core_siblings[i])) {
+    if (!data->ReadStringWithSizeFromData(&cpu_topology.core_siblings[i]))
       return false;
-    }
   }
 
   num_siblings_type num_thread_siblings;
-  if (!data->ReadDataValue(sizeof(num_thread_siblings), "num threads",
-                           &num_thread_siblings)) {
+  if (!data->ReadUint32(&num_thread_siblings)) {
+    LOG(ERROR) << "Error reading num core siblings.";
     return false;
   }
-  if (is_cross_endian_)
-    ByteSwap(&num_thread_siblings);
 
-  cpu_topology_.thread_siblings.resize(num_thread_siblings);
+  cpu_topology.thread_siblings.resize(num_thread_siblings);
   for (size_t i = 0; i < num_thread_siblings; ++i) {
-    if (!ReadStringFromBuffer(data, is_cross_endian_,
-                              &cpu_topology_.thread_siblings[i])) {
+    if (!data->ReadStringWithSizeFromData(&cpu_topology.thread_siblings[i]))
       return false;
-    }
   }
 
+  serializer_.SerializeCPUTopologyMetadata(cpu_topology,
+                                           proto_->mutable_cpu_topology());
   return true;
 }
 
-bool PerfReader::ReadNUMATopologyMetadata(DataReader* data, u32 type,
+bool PerfReader::ReadNUMATopologyMetadata(DataReader* data,
+                                          u32 type,
                                           size_t size) {
   numa_topology_num_nodes_type num_nodes;
-  if (!data->ReadDataValue(sizeof(num_nodes), "num nodes", &num_nodes))
+  if (!data->ReadUint32(&num_nodes)) {
+    LOG(ERROR) << "Error reading NUMA topology num nodes.";
     return false;
-  if (is_cross_endian_)
-    ByteSwap(&num_nodes);
+  }
 
   for (size_t i = 0; i < num_nodes; ++i) {
     PerfNodeTopologyMetadata node;
-    if (!data->ReadDataValue(sizeof(node.id), "node id", &node.id) ||
-        !data->ReadDataValue(sizeof(node.total_memory), "node total memory",
-                             &node.total_memory) ||
-        !data->ReadDataValue(sizeof(node.free_memory), "node free memory",
-                             &node.free_memory) ||
-        !ReadStringFromBuffer(data, is_cross_endian_, &node.cpu_list)) {
+    if (!data->ReadUint32(&node.id) ||
+        !data->ReadUint64(&node.total_memory) ||
+        !data->ReadUint64(&node.free_memory) ||
+        !data->ReadStringWithSizeFromData(&node.cpu_list)) {
+      LOG(ERROR) << "Error reading NUMA topology info for node #" << i;
       return false;
     }
-    if (is_cross_endian_) {
-      ByteSwap(&node.id);
-      ByteSwap(&node.total_memory);
-      ByteSwap(&node.free_memory);
-    }
-    numa_topology_.push_back(node);
+    serializer_.SerializeNodeTopologyMetadata(node,
+                                              proto_->add_numa_topology());
   }
   return true;
 }
-
-// TODO(cwp-team): Move this to match the order in the header file.
 bool PerfReader::ReadTracingMetadata(DataReader* data, size_t size) {
-  tracing_data_.resize(size);
-  return data->ReadDataValue(tracing_data_.size(), "tracing_data",
-                             tracing_data_.data());
+  std::vector<char> tracing_data(size);
+  if (!data->ReadDataValue(tracing_data.size(), "tracing_data",
+                           tracing_data.data())) {
+    return false;
+  }
+  serializer_.SerializeTracingMetadata(tracing_data, proto_);
+  return true;
 }
 
 bool PerfReader::ReadPipedData(DataReader* data) {
   // The piped data comes right after the file header.
   CHECK_EQ(piped_header_.size, data->Tell());
   bool result = true;
-  size_t num_event_types = 0;
+  int num_event_types = 0;
 
-  metadata_mask_ = 0;
   CheckNoEventHeaderPadding();
 
-  while (result) {
+  while (result && data->Tell() < data->size()) {
     perf_event_header header;
-    // Read the header and swap bytes if necessary.
-    if (!data->ReadDataValue(sizeof(header), "piped event header", &header))
+    if (!ReadPerfEventHeader(data, &header)) {
+      LOG(ERROR) << "Error reading event header.";
       break;
-
-    if (is_cross_endian_) {
-      ByteSwap(&header.type);
-      ByteSwap(&header.misc);
-      ByteSwap(&header.size);
     }
 
     if (header.size == 0) {
@@ -1655,8 +1256,12 @@ bool PerfReader::ReadPipedData(DataReader* data) {
                                &event->header + 1)) {
         break;
       }
-      MaybeSwapEventFields(event.get());
-      events_.push_back(std::move(event));
+      MaybeSwapEventFields(event.get(), data->is_cross_endian());
+
+      // Serialize the event to protobuf form.
+      PerfEvent* proto_event = proto_->add_events();
+      if (!serializer_.SerializeEvent(event, proto_event))
+        return false;
 
       continue;
     }
@@ -1669,69 +1274,89 @@ bool PerfReader::ReadPipedData(DataReader* data) {
       result = ReadEventType(data, num_event_types++, header.size);
       break;
     case PERF_RECORD_HEADER_EVENT_DESC:
-      metadata_mask_ |= (1 << HEADER_EVENT_DESC);
+      set_metadata_mask_bit(HEADER_EVENT_DESC);
       result = ReadEventDescMetadata(data, HEADER_EVENT_DESC,
                                      size_without_header);
       break;
     case PERF_RECORD_HEADER_TRACING_DATA:
-      metadata_mask_ |= (1 << HEADER_TRACING_DATA);
+      set_metadata_mask_bit(HEADER_TRACING_DATA);
       {
         // TRACING_DATA's header.size is a lie. It is the size of only the event
         // struct. The size of the data is in the event struct, and followed
         // immediately by the tracing header data.
         decltype(tracing_data_event::size) size = 0;
-        if (!data->ReadDataValue(sizeof(size), "size of tracing data", &size))
+        if (!data->ReadUint32(&size)) {
+          LOG(ERROR) << "Error reading tracing data size.";
           return false;
+        }
         result = ReadTracingMetadata(data, size);
       }
       break;
     case PERF_RECORD_HEADER_BUILD_ID:
-      metadata_mask_ |= (1 << HEADER_BUILD_ID);
+      set_metadata_mask_bit(HEADER_BUILD_ID);
       result = ReadBuildIDMetadataWithoutHeader(data, header);
       break;
     case PERF_RECORD_HEADER_HOSTNAME:
-      metadata_mask_ |= (1 << HEADER_HOSTNAME);
-      result = ReadStringMetadata(data, HEADER_HOSTNAME, size_without_header);
+      set_metadata_mask_bit(HEADER_HOSTNAME);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_hostname());
       break;
     case PERF_RECORD_HEADER_OSRELEASE:
-      metadata_mask_ |= (1 << HEADER_OSRELEASE);
-      result = ReadStringMetadata(data, HEADER_OSRELEASE, size_without_header);
+      set_metadata_mask_bit(HEADER_OSRELEASE);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_kernel_version());
       break;
     case PERF_RECORD_HEADER_VERSION:
-      metadata_mask_ |= (1 << HEADER_VERSION);
-      result = ReadStringMetadata(data, HEADER_VERSION, size_without_header);
+      set_metadata_mask_bit(HEADER_VERSION);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_perf_version());
       break;
     case PERF_RECORD_HEADER_ARCH:
-      metadata_mask_ |= (1 << HEADER_ARCH);
-      result = ReadStringMetadata(data, HEADER_ARCH, size_without_header);
+      set_metadata_mask_bit(HEADER_ARCH);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_architecture());
       break;
     case PERF_RECORD_HEADER_CPUDESC:
-      metadata_mask_ |= (1 << HEADER_CPUDESC);
-      result = ReadStringMetadata(data, HEADER_CPUDESC, size_without_header);
+      set_metadata_mask_bit(HEADER_CPUDESC);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_cpu_description());
       break;
     case PERF_RECORD_HEADER_CPUID:
-      metadata_mask_ |= (1 << HEADER_CPUID);
-      result = ReadStringMetadata(data, HEADER_CPUID, size_without_header);
+      set_metadata_mask_bit(HEADER_CPUID);
+      result = ReadSingleStringMetadata(
+          data, size_without_header,
+          proto_->mutable_string_metadata()->mutable_cpu_id());
       break;
     case PERF_RECORD_HEADER_CMDLINE:
-      metadata_mask_ |= (1 << HEADER_CMDLINE);
-      result = ReadStringMetadata(data, HEADER_CMDLINE, size_without_header);
+    {
+      set_metadata_mask_bit(HEADER_CMDLINE);
+      auto* string_metadata = proto_->mutable_string_metadata();
+      result = ReadRepeatedStringMetadata(
+                   data, size_without_header,
+                   string_metadata->mutable_perf_command_line_token(),
+                   string_metadata->mutable_perf_command_line_whole());
       break;
+    }
     case PERF_RECORD_HEADER_NRCPUS:
-      metadata_mask_ |= (1 << HEADER_NRCPUS);
+      set_metadata_mask_bit(HEADER_NRCPUS);
       result = ReadUint32Metadata(data, HEADER_NRCPUS, size_without_header);
       break;
     case PERF_RECORD_HEADER_TOTAL_MEM:
-      metadata_mask_ |= (1 << HEADER_TOTAL_MEM);
+      set_metadata_mask_bit(HEADER_TOTAL_MEM);
       result = ReadUint64Metadata(data, HEADER_TOTAL_MEM, size_without_header);
       break;
     case PERF_RECORD_HEADER_CPU_TOPOLOGY:
-      metadata_mask_ |= (1 << HEADER_CPU_TOPOLOGY);
+      set_metadata_mask_bit(HEADER_CPU_TOPOLOGY);
       result = ReadCPUTopologyMetadata(data, HEADER_CPU_TOPOLOGY,
                                        size_without_header);
       break;
     case PERF_RECORD_HEADER_NUMA_TOPOLOGY:
-      metadata_mask_ |= (1 << HEADER_NUMA_TOPOLOGY);
+      set_metadata_mask_bit(HEADER_NUMA_TOPOLOGY);
       result = ReadNUMATopologyMetadata(data, HEADER_NUMA_TOPOLOGY,
                                         size_without_header);
       break;
@@ -1754,43 +1379,45 @@ bool PerfReader::ReadPipedData(DataReader* data) {
   // The PERF_RECORD_HEADER_EVENT_TYPE events are obsolete, but if present
   // and PERF_RECORD_HEADER_EVENT_DESC metadata events are not, we should use
   // them. Otherwise, we should use prefer the _EVENT_DESC data.
-  if (!(metadata_mask_ & (1 << HEADER_EVENT_DESC)) &&
-      num_event_types == attrs_.size()) {
+  if (!get_metadata_mask_bit(HEADER_EVENT_DESC) &&
+      num_event_types == proto_->file_attrs().size()) {
     // We can construct HEADER_EVENT_DESC:
-    metadata_mask_ |= (1 << HEADER_EVENT_DESC);
+    set_metadata_mask_bit(HEADER_EVENT_DESC);
   }
+
   return result;
 }
 
-bool PerfReader::WriteHeader(DataWriter* data) const {
+bool PerfReader::WriteHeader(const struct perf_file_header& header,
+                             DataWriter* data) const {
   CheckNoEventHeaderPadding();
-  size_t size = sizeof(out_header_);
-  return data->WriteDataValue(&out_header_, size, "file header");
+  size_t size = sizeof(header);
+  return data->WriteDataValue(&header, size, "file header");
 }
 
-bool PerfReader::WriteAttrs(DataWriter* data) const {
+bool PerfReader::WriteAttrs(const struct perf_file_header& header,
+                            DataWriter* data) const {
   CheckNoPerfEventAttrPadding();
-  const size_t id_offset = out_header_.size;
+  const size_t id_offset = header.size;
   CHECK_EQ(id_offset, data->Tell());
 
   std::vector<struct perf_file_section> id_sections;
-  id_sections.reserve(attrs_.size());
-  for (size_t i = 0; i < attrs_.size(); i++) {
-    const PerfFileAttr& attr = attrs_[i];
+  id_sections.reserve(attrs().size());
+  for (const auto& attr : proto_->file_attrs()) {
     size_t section_size =
-        attr.ids.size() * sizeof(decltype(attr.ids)::value_type);
+        attr.ids_size() * sizeof(decltype(PerfFileAttr::ids)::value_type);
     id_sections.push_back(perf_file_section{data->Tell(), section_size});
-    for (size_t j = 0; j < attr.ids.size(); j++) {
-      const uint64_t id = attr.ids[j];
+    for (const uint64_t& id : attr.ids()) {
       if (!data->WriteDataValue(&id, sizeof(id), "ID info"))
         return false;
     }
   }
 
-  CHECK_EQ(out_header_.attrs.offset, data->Tell());
-  for (size_t i = 0; i < attrs_.size(); i++) {
+  CHECK_EQ(header.attrs.offset, data->Tell());
+  for (int i = 0; i < attrs().size(); i++) {
     const struct perf_file_section& id_section = id_sections[i];
-    const PerfFileAttr& attr = attrs_[i];
+    PerfFileAttr attr;
+    serializer_.DeserializePerfFileAttr(proto_->file_attrs(i), &attr);
     if (!data->WriteDataValue(&attr.attr, sizeof(attr.attr), "attribute") ||
         !data->WriteDataValue(&id_section, sizeof(id_section), "ID section")) {
       return false;
@@ -1799,19 +1426,29 @@ bool PerfReader::WriteAttrs(DataWriter* data) const {
   return true;
 }
 
-bool PerfReader::WriteData(DataWriter* data) const {
-  CHECK_EQ(out_header_.data.offset, data->Tell());
-  for (size_t i = 0; i < events_.size(); ++i) {
-    if (!data->WriteDataValue(events_[i].get(), events_[i]->header.size,
-                              "event data")) {
+bool PerfReader::WriteData(const struct perf_file_header& header,
+                           DataWriter* data) const {
+  // No need to CHECK anything if no event data is being written.
+  if (proto_->events().empty()) return true;
+
+  CHECK(serializer_.SampleInfoReaderAvailable());
+  CHECK_EQ(header.data.offset, data->Tell());
+  for (const PerfEvent& proto_event : proto_->events()) {
+    malloced_unique_ptr<event_t> event;
+    // The nominal size given by |proto_event| may not be correct, as the
+    // contents may have changed since the PerfEvent was created. Use the size
+    // in the event_t returned by PerfSerializer::DeserializeEvent().
+    if (!serializer_.DeserializeEvent(proto_event, &event) ||
+        !data->WriteDataValue(event.get(), event->header.size, "event data")) {
       return false;
     }
   }
   return true;
 }
 
-bool PerfReader::WriteMetadata(DataWriter* data) const {
-  const size_t header_offset = out_header_.data.offset + out_header_.data.size;
+bool PerfReader::WriteMetadata(const struct perf_file_header& header,
+                               DataWriter* data) const {
+  const size_t header_offset = header.data.offset + header.data.size;
   CHECK_EQ(header_offset, data->Tell());
 
   // There is one header for each feature pointing to the metadata for that
@@ -1825,8 +1462,11 @@ bool PerfReader::WriteMetadata(DataWriter* data) const {
   std::vector<struct perf_file_section> metadata_sections;
   metadata_sections.reserve(GetNumSupportedMetadata());
 
+  // For less verbose access to string metadata fields.
+  const auto& string_metadata = proto_->string_metadata();
+
   for (u32 type = HEADER_FIRST_FEATURE; type != HEADER_LAST_FEATURE; ++type) {
-    if ((out_header_.adds_features[0] & (1 << type)) == 0)
+    if ((header.adds_features[0] & (1 << type)) == 0)
       continue;
 
     struct perf_file_section header_entry;
@@ -1834,7 +1474,7 @@ bool PerfReader::WriteMetadata(DataWriter* data) const {
     // Write actual metadata to address metadata_offset
     switch (type) {
     case HEADER_TRACING_DATA:
-      if (!data->WriteDataValue(tracing_data_.data(), tracing_data_.size(),
+      if (!data->WriteDataValue(tracing_data().data(), tracing_data().size(),
                                 "tracing data")) {
         return false;
       }
@@ -1844,14 +1484,35 @@ bool PerfReader::WriteMetadata(DataWriter* data) const {
         return false;
       break;
     case HEADER_HOSTNAME:
-    case HEADER_OSRELEASE:
-    case HEADER_VERSION:
-    case HEADER_ARCH:
-    case HEADER_CPUDESC:
-    case HEADER_CPUID:
-    case HEADER_CMDLINE:
-      if (!WriteStringMetadata(type, data))
+      if (!WriteSingleStringMetadata(string_metadata.hostname(), data))
         return false;
+      break;
+    case HEADER_OSRELEASE:
+      if (!WriteSingleStringMetadata(string_metadata.kernel_version(), data))
+        return false;
+      break;
+    case HEADER_VERSION:
+      if (!WriteSingleStringMetadata(string_metadata.perf_version(), data))
+        return false;
+      break;
+    case HEADER_ARCH:
+      if (!WriteSingleStringMetadata(string_metadata.architecture(), data))
+        return false;
+      break;
+    case HEADER_CPUDESC:
+      if (!WriteSingleStringMetadata(string_metadata.cpu_description(), data))
+        return false;
+      break;
+    case HEADER_CPUID:
+      if (!WriteSingleStringMetadata(string_metadata.cpu_id(), data))
+        return false;
+      break;
+    case HEADER_CMDLINE:
+      if (!WriteRepeatedStringMetadata(
+              string_metadata.perf_command_line_token(),
+              data)) {
+        return false;
+      }
       break;
     case HEADER_NRCPUS:
       if (!WriteUint32Metadata(type, data))
@@ -1904,73 +1565,66 @@ bool PerfReader::WriteMetadata(DataWriter* data) const {
 
 bool PerfReader::WriteBuildIDMetadata(u32 type, DataWriter* data) const {
   CheckNoBuildIDEventPadding();
-  for (size_t i = 0; i < build_id_events_.size(); ++i) {
-    const build_id_event* event = build_id_events_[i];
-    if (!data->WriteDataValue(event, event->header.size, "Build ID metadata"))
+  for (const auto& build_id : proto_->build_ids()) {
+    malloced_unique_ptr<build_id_event> event;
+    if (!serializer_.DeserializeBuildIDEvent(build_id, &event)) {
+      LOG(ERROR) << "Could not deserialize build ID event with build ID "
+                 << RawDataToHexString(build_id.build_id_hash());
+      return false;
+    }
+    if (!data->WriteDataValue(event.get(), event->header.size,
+                              "Build ID metadata")) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool PerfReader::WriteSingleStringMetadata(const StringAndMd5sumPrefix& src,
+                                           DataWriter* data) const {
+  return data->WriteStringWithSizeToData(src.value());
+}
+
+bool PerfReader::WriteRepeatedStringMetadata(
+    const RepeatedPtrField<StringAndMd5sumPrefix>& src_array,
+    DataWriter* data) const {
+  num_string_data_type num_strings = src_array.size();
+  if (!data->WriteDataValue(&num_strings, sizeof(num_strings),
+                           "number of string metadata")) {
+    return false;
+  }
+  for (const auto& src_entry : src_array) {
+    if (!data->WriteStringWithSizeToData(src_entry.value()))
       return false;
   }
   return true;
 }
 
-bool PerfReader::WriteStringMetadata(u32 type, DataWriter* data) const {
-  for (size_t i = 0; i < string_metadata_.size(); ++i) {
-    const PerfStringMetadata& str_data = string_metadata_[i];
-    if (str_data.type == type) {
-      num_string_data_type num_strings = str_data.data.size();
-      if (NeedsNumberOfStringData(type) &&
-          !data->WriteDataValue(&num_strings, sizeof(num_strings),
-                                "number of string metadata")) {
-        return false;
-      }
-
-      for (size_t j = 0; j < num_strings; ++j) {
-        const CStringWithLength& single_string = str_data.data[j];
-        if (!WriteStringToBuffer(single_string, data))
-          return false;
-      }
-
-      return true;
-    }
-  }
-  LOG(ERROR) << "String metadata of type " << type << " not present";
-  return false;
-}
-
 bool PerfReader::WriteUint32Metadata(u32 type, DataWriter* data) const {
-  for (size_t i = 0; i < uint32_metadata_.size(); ++i) {
-    const PerfUint32Metadata& uint32_data = uint32_metadata_[i];
-    if (uint32_data.type == type) {
-      const std::vector<uint32_t>& int_vector = uint32_data.data;
-
-      for (size_t j = 0; j < int_vector.size(); ++j) {
-        if (!data->WriteDataValue(&int_vector[j], sizeof(int_vector[j]),
-                                  "uint32_t metadata")) {
-          return false;
-        }
-      }
-
-      return true;
-    }
+  for (const auto& metadata : proto_->uint32_metadata()) {
+    if (metadata.type() != type)
+      continue;
+    PerfUint32Metadata local_metadata;
+    serializer_.DeserializeSingleUint32Metadata(metadata, &local_metadata);
+    const std::vector<uint32_t>& raw_data = local_metadata.data;
+    return data->WriteDataValue(raw_data.data(),
+                                raw_data.size() * sizeof(uint32_t),
+                                "uint32_t metadata");
   }
   LOG(ERROR) << "Uint32 metadata of type " << type << " not present";
   return false;
 }
 
 bool PerfReader::WriteUint64Metadata(u32 type, DataWriter* data) const {
-  for (size_t i = 0; i < uint64_metadata_.size(); ++i) {
-    const PerfUint64Metadata& uint64_data = uint64_metadata_[i];
-    if (uint64_data.type == type) {
-      const std::vector<uint64_t>& int_vector = uint64_data.data;
-
-      for (size_t j = 0; j < int_vector.size(); ++j) {
-        if (!data->WriteDataValue(&int_vector[j], sizeof(int_vector[j]),
-                                  "uint64_t metadata")) {
-          return false;
-        }
-      }
-
-      return true;
-    }
+  for (const auto& metadata : proto_->uint64_metadata()) {
+    if (metadata.type() != type)
+      continue;
+    PerfUint64Metadata local_metadata;
+    serializer_.DeserializeSingleUint64Metadata(metadata, &local_metadata);
+    const std::vector<uint64_t>& raw_data = local_metadata.data;
+    return data->WriteDataValue(raw_data.data(),
+                                raw_data.size() * sizeof(uint64_t),
+                                "uint32_t metadata");
   }
   LOG(ERROR) << "Uint64 metadata of type " << type << " not present";
   return false;
@@ -1979,7 +1633,13 @@ bool PerfReader::WriteUint64Metadata(u32 type, DataWriter* data) const {
 bool PerfReader::WriteEventDescMetadata(u32 type, DataWriter* data) const {
   CheckNoPerfEventAttrPadding();
 
-  event_desc_num_events num_events = attrs_.size();
+  if (attrs().size() > event_types().size()) {
+    LOG(ERROR) << "Number of attrs (" << attrs().size() << ") cannot exceed "
+               << "number of event types (" << event_types().size() << ")";
+    return false;
+  }
+
+  event_desc_num_events num_events = proto_->file_attrs().size();
   if (!data->WriteDataValue(&num_events, sizeof(num_events),
                             "event_desc num_events")) {
     return false;
@@ -1990,8 +1650,13 @@ bool PerfReader::WriteEventDescMetadata(u32 type, DataWriter* data) const {
     return false;
   }
 
-  for (size_t i = 0; i < num_events; ++i) {
-    const PerfFileAttr& attr = attrs_[i];
+  for (int i = 0; i < attrs().size(); ++i) {
+    const auto& stored_attr = attrs().Get(i);
+    PerfFileAttr attr;
+    serializer_.DeserializePerfFileAttr(stored_attr, &attr);
+    if (!serializer_.DeserializePerfEventType(proto_->event_types(i), &attr))
+      return false;
+
     if (!data->WriteDataValue(&attr.attr, sizeof(attr.attr),
                               "event_desc attribute")) {
       return false;
@@ -2003,10 +1668,7 @@ bool PerfReader::WriteEventDescMetadata(u32 type, DataWriter* data) const {
       return false;
     }
 
-    CStringWithLength container;
-    container.len = GetUint64AlignedStringLength(attr.name);
-    container.str = attr.name;
-    if (!WriteStringToBuffer(container, data))
+    if (!data->WriteStringWithSizeToData(attr.name))
       return false;
 
     if (!data->WriteDataValue(attr.ids.data(), num_ids * sizeof(attr.ids[0]),
@@ -2018,21 +1680,25 @@ bool PerfReader::WriteEventDescMetadata(u32 type, DataWriter* data) const {
 }
 
 bool PerfReader::WriteCPUTopologyMetadata(u32 type, DataWriter* data) const {
-  const std::vector<CStringWithLength>& cores = cpu_topology_.core_siblings;
+  PerfCPUTopologyMetadata cpu_topology;
+  serializer_.DeserializeCPUTopologyMetadata(proto_->cpu_topology(),
+                                             &cpu_topology);
+
+  std::vector<string>& cores = cpu_topology.core_siblings;
   num_siblings_type num_cores = cores.size();
   if (!data->WriteDataValue(&num_cores, sizeof(num_cores), "num cores"))
     return false;
-  for (size_t i = 0; i < num_cores; ++i) {
-    if (!WriteStringToBuffer(cores[i], data))
+  for (string& core_name : cores) {
+    if (!data->WriteStringWithSizeToData(core_name))
       return false;
   }
 
-  const std::vector<CStringWithLength>& threads = cpu_topology_.thread_siblings;
+  std::vector<string>& threads = cpu_topology.thread_siblings;
   num_siblings_type num_threads = threads.size();
   if (!data->WriteDataValue(&num_threads, sizeof(num_threads), "num threads"))
     return false;
-  for (size_t i = 0; i < num_threads; ++i) {
-    if (!WriteStringToBuffer(threads[i], data))
+  for (string& thread_name : threads) {
+    if (!data->WriteStringWithSizeToData(thread_name))
       return false;
   }
 
@@ -2040,42 +1706,23 @@ bool PerfReader::WriteCPUTopologyMetadata(u32 type, DataWriter* data) const {
 }
 
 bool PerfReader::WriteNUMATopologyMetadata(u32 type, DataWriter* data) const {
-  numa_topology_num_nodes_type num_nodes = numa_topology_.size();
+  numa_topology_num_nodes_type num_nodes = proto_->numa_topology().size();
   if (!data->WriteDataValue(&num_nodes, sizeof(num_nodes), "num nodes"))
     return false;
 
-  for (size_t i = 0; i < num_nodes; ++i) {
-    const PerfNodeTopologyMetadata& node = numa_topology_[i];
+  for (const auto& node_proto : proto_->numa_topology()) {
+    PerfNodeTopologyMetadata node;
+    serializer_.DeserializeNodeTopologyMetadata(node_proto, &node);
+
     if (!data->WriteDataValue(&node.id, sizeof(node.id), "node id") ||
         !data->WriteDataValue(&node.total_memory, sizeof(node.total_memory),
                               "node total memory") ||
         !data->WriteDataValue(&node.free_memory, sizeof(node.free_memory),
                               "node free memory") ||
-        !WriteStringToBuffer(node.cpu_list, data)) {
-    }
-  }
-  return true;
-}
-
-bool PerfReader::WriteEventTypes(DataWriter* data) const {
-  CheckNoEventTypePadding();
-  const size_t event_types_size = out_header_.event_types.size;
-  if (event_types_size == 0)
-    return true;
-
-  data->SeekSet(out_header_.event_types.offset);
-  for (size_t i = 0; i < attrs_.size(); ++i) {
-    struct perf_trace_event_type event_type = {0};
-    event_type.event_id = attrs_[i].attr.config;
-    const string& name = attrs_[i].name;
-    memcpy(&event_type.name, name.data(),
-           std::min(name.size(), sizeof(event_type.name)));
-    if (!data->WriteDataValue(&event_type, sizeof(event_type),
-                              "event type info")) {
+        !data->WriteStringWithSizeToData(node.cpu_list)) {
       return false;
     }
   }
-  CHECK_EQ(event_types_size, data->Tell() - out_header_.event_types.offset);
   return true;
 }
 
@@ -2095,89 +1742,101 @@ bool PerfReader::ReadAttrEventBlock(DataReader* data, size_t size) {
 
   // Event types are found many times in the perf data file.
   // Only add this event type if it is not already present.
-  for (size_t i = 0; i < attrs_.size(); ++i) {
-    if (attrs_[i].ids[0] == attr.ids[0])
-      return true;
+  if (!attr.ids.empty() &&
+      file_attrs_seen_.find(attr.ids[0]) != file_attrs_seen_.end()) {
+    return true;
   }
-  attrs_.push_back(attr);
+
+  AddPerfFileAttr(attr);
   return true;
 }
 
-void PerfReader::MaybeSwapEventFields(event_t* event) {
+void PerfReader::MaybeSwapEventFields(event_t* event, bool is_cross_endian) {
+  if (!is_cross_endian)
+    return;
   uint32_t type = event->header.type;
-  if (is_cross_endian_) {
-    switch (type) {
-    case PERF_RECORD_SAMPLE:
-      break;
-    case PERF_RECORD_MMAP:
-      ByteSwap(&event->mmap.pid);
-      ByteSwap(&event->mmap.tid);
-      ByteSwap(&event->mmap.start);
-      ByteSwap(&event->mmap.len);
-      ByteSwap(&event->mmap.pgoff);
-      break;
-    case PERF_RECORD_MMAP2:
-      ByteSwap(&event->mmap2.pid);
-      ByteSwap(&event->mmap2.tid);
-      ByteSwap(&event->mmap2.start);
-      ByteSwap(&event->mmap2.len);
-      ByteSwap(&event->mmap2.pgoff);
-      ByteSwap(&event->mmap2.maj);
-      ByteSwap(&event->mmap2.min);
-      ByteSwap(&event->mmap2.ino);
-      ByteSwap(&event->mmap2.ino_generation);
-      ByteSwap(&event->mmap2.prot);
-      ByteSwap(&event->mmap2.flags);
-      break;
-    case PERF_RECORD_FORK:
-    case PERF_RECORD_EXIT:
-      ByteSwap(&event->fork.pid);
-      ByteSwap(&event->fork.tid);
-      ByteSwap(&event->fork.ppid);
-      ByteSwap(&event->fork.ptid);
-      break;
-    case PERF_RECORD_COMM:
-      ByteSwap(&event->comm.pid);
-      ByteSwap(&event->comm.tid);
-      break;
-    case PERF_RECORD_LOST:
-      ByteSwap(&event->lost.id);
-      ByteSwap(&event->lost.lost);
-      break;
-    case PERF_RECORD_THROTTLE:
-    case PERF_RECORD_UNTHROTTLE:
-      ByteSwap(&event->throttle.time);
-      ByteSwap(&event->throttle.id);
-      ByteSwap(&event->throttle.stream_id);
-      break;
-    case PERF_RECORD_READ:
-      ByteSwap(&event->read.pid);
-      ByteSwap(&event->read.tid);
-      ByteSwap(&event->read.value);
-      ByteSwap(&event->read.time_enabled);
-      ByteSwap(&event->read.time_running);
-      ByteSwap(&event->read.id);
-      break;
-    default:
-      LOG(FATAL) << "Unknown event type: " << type;
-    }
+  switch (type) {
+  case PERF_RECORD_SAMPLE:
+    break;
+  case PERF_RECORD_MMAP:
+    ByteSwap(&event->mmap.pid);
+    ByteSwap(&event->mmap.tid);
+    ByteSwap(&event->mmap.start);
+    ByteSwap(&event->mmap.len);
+    ByteSwap(&event->mmap.pgoff);
+    break;
+  case PERF_RECORD_MMAP2:
+    ByteSwap(&event->mmap2.pid);
+    ByteSwap(&event->mmap2.tid);
+    ByteSwap(&event->mmap2.start);
+    ByteSwap(&event->mmap2.len);
+    ByteSwap(&event->mmap2.pgoff);
+    ByteSwap(&event->mmap2.maj);
+    ByteSwap(&event->mmap2.min);
+    ByteSwap(&event->mmap2.ino);
+    ByteSwap(&event->mmap2.ino_generation);
+    ByteSwap(&event->mmap2.prot);
+    ByteSwap(&event->mmap2.flags);
+    break;
+  case PERF_RECORD_FORK:
+  case PERF_RECORD_EXIT:
+    ByteSwap(&event->fork.pid);
+    ByteSwap(&event->fork.tid);
+    ByteSwap(&event->fork.ppid);
+    ByteSwap(&event->fork.ptid);
+    ByteSwap(&event->fork.time);
+    break;
+  case PERF_RECORD_COMM:
+    ByteSwap(&event->comm.pid);
+    ByteSwap(&event->comm.tid);
+    break;
+  case PERF_RECORD_LOST:
+    ByteSwap(&event->lost.id);
+    ByteSwap(&event->lost.lost);
+    break;
+  case PERF_RECORD_THROTTLE:
+  case PERF_RECORD_UNTHROTTLE:
+    ByteSwap(&event->throttle.time);
+    ByteSwap(&event->throttle.id);
+    ByteSwap(&event->throttle.stream_id);
+    break;
+  case PERF_RECORD_READ:
+    ByteSwap(&event->read.pid);
+    ByteSwap(&event->read.tid);
+    ByteSwap(&event->read.value);
+    ByteSwap(&event->read.time_enabled);
+    ByteSwap(&event->read.time_running);
+    ByteSwap(&event->read.id);
+    break;
+  default:
+    LOG(FATAL) << "Unknown event type: " << type;
   }
+
+  // Do not swap the sample info fields that are not explicitly listed in the
+  // struct definition of each event type. Leave that up to SampleInfoReader
+  // within |serializer_|.
 }
 
 size_t PerfReader::GetNumSupportedMetadata() const {
-  return GetNumBits(metadata_mask_ & kSupportedMetadataMask);
+  return GetNumBits(metadata_mask() & kSupportedMetadataMask);
 }
 
 size_t PerfReader::GetEventDescMetadataSize() const {
+  if (attrs().size() > event_types().size()) {
+    LOG(ERROR) << "Number of attrs (" << attrs().size() << ") cannot exceed "
+               << "number of event types (" << event_types().size() << ")";
+    return 0;
+  }
+
   size_t size = 0;
-  if (metadata_mask_ & (1 << HEADER_EVENT_DESC)) {
+  if (get_metadata_mask_bit(HEADER_EVENT_DESC)) {
     size += sizeof(event_desc_num_events) + sizeof(event_desc_attr_size);
-    CStringWithLength dummy;
-    for (size_t i = 0; i < attrs_.size(); ++i) {
-      size += sizeof(perf_event_attr) + sizeof(dummy.len);
+    for (int i = 0; i < attrs().size(); ++i) {
+      size += sizeof(perf_event_attr);
       size += sizeof(event_desc_num_unique_ids);
-      size += GetUint64AlignedStringLength(attrs_[i].name);
-      size += attrs_[i].ids.size() * sizeof(attrs_[i].ids[0]);
+      size += ExpectedStorageSizeOf(event_types().Get(i).name());
+      size += attrs().Get(i).ids_size() *
+              sizeof(decltype(PerfFileAttr::ids)::value_type);
     }
   }
   return size;
@@ -2185,69 +1844,70 @@ size_t PerfReader::GetEventDescMetadataSize() const {
 
 size_t PerfReader::GetBuildIDMetadataSize() const {
   size_t size = 0;
-  for (size_t i = 0; i < build_id_events_.size(); ++i)
-    size += build_id_events_[i]->header.size;
+  for (const auto& build_id : proto_->build_ids()) {
+    size += sizeof(build_id_event) +
+            GetUint64AlignedStringLength(build_id.filename());
+  }
   return size;
 }
 
 size_t PerfReader::GetStringMetadataSize() const {
   size_t size = 0;
-  for (size_t i = 0; i < string_metadata_.size(); ++i) {
-    const PerfStringMetadata& metadata = string_metadata_[i];
-    if (NeedsNumberOfStringData(metadata.type))
-      size += sizeof(num_string_data_type);
+  if (string_metadata().has_hostname())
+    size += ExpectedStorageSizeOf(string_metadata().hostname().value());
+  if (string_metadata().has_kernel_version())
+    size += ExpectedStorageSizeOf(string_metadata().kernel_version().value());
+  if (string_metadata().has_perf_version())
+    size += ExpectedStorageSizeOf(string_metadata().perf_version().value());
+  if (string_metadata().has_architecture())
+    size += ExpectedStorageSizeOf(string_metadata().architecture().value());
+  if (string_metadata().has_cpu_description())
+    size += ExpectedStorageSizeOf(string_metadata().cpu_description().value());
+  if (string_metadata().has_cpu_id())
+    size += ExpectedStorageSizeOf(string_metadata().cpu_id().value());
 
-    for (size_t j = 0; j < metadata.data.size(); ++j) {
-      const CStringWithLength& str = metadata.data[j];
-      size += sizeof(str.len) + str.len;
-    }
+  if (!string_metadata().perf_command_line_token().empty()) {
+    size += sizeof(num_string_data_type);
+    for (const auto& token : string_metadata().perf_command_line_token())
+      size += ExpectedStorageSizeOf(token.value());
   }
   return size;
 }
 
 size_t PerfReader::GetUint32MetadataSize() const {
   size_t size = 0;
-  for (size_t i = 0; i < uint32_metadata_.size(); ++i) {
-    const PerfUint32Metadata& metadata = uint32_metadata_[i];
-    size += metadata.data.size() * sizeof(metadata.data[0]);
-  }
+  for (const auto& metadata : proto_->uint32_metadata())
+    size += metadata.data().size() * sizeof(uint32_t);
   return size;
 }
 
 size_t PerfReader::GetUint64MetadataSize() const {
   size_t size = 0;
-  for (size_t i = 0; i < uint64_metadata_.size(); ++i) {
-    const PerfUint64Metadata& metadata = uint64_metadata_[i];
-    size += metadata.data.size() * sizeof(metadata.data[0]);
-  }
+  for (const auto& metadata : proto_->uint64_metadata())
+    size += metadata.data().size() * sizeof(uint64_t);
   return size;
 }
 
 size_t PerfReader::GetCPUTopologyMetadataSize() const {
   // Core siblings.
   size_t size = sizeof(num_siblings_type);
-  for (size_t i = 0; i < cpu_topology_.core_siblings.size(); ++i) {
-    const CStringWithLength& str = cpu_topology_.core_siblings[i];
-    size += sizeof(str.len) + str.len;
-  }
+  for (const string& core_sibling : proto_->cpu_topology().core_siblings())
+    size += ExpectedStorageSizeOf(core_sibling);
 
   // Thread siblings.
   size += sizeof(num_siblings_type);
-  for (size_t i = 0; i < cpu_topology_.thread_siblings.size(); ++i) {
-    const CStringWithLength& str = cpu_topology_.thread_siblings[i];
-    size += sizeof(str.len) + str.len;
-  }
+  for (const string& thread_sibling : proto_->cpu_topology().thread_siblings())
+    size += ExpectedStorageSizeOf(thread_sibling);
 
   return size;
 }
 
 size_t PerfReader::GetNUMATopologyMetadataSize() const {
   size_t size = sizeof(numa_topology_num_nodes_type);
-  for (size_t i = 0; i < numa_topology_.size(); ++i) {
-    const PerfNodeTopologyMetadata& node = numa_topology_[i];
-    size += sizeof(node.id);
-    size += sizeof(node.total_memory) + sizeof(node.free_memory);
-    size += sizeof(node.cpu_list.len) + node.cpu_list.len;
+  for (const auto& node : proto_->numa_topology()) {
+    size += sizeof(node.id());
+    size += sizeof(node.total_memory()) + sizeof(node.free_memory());
+    size += ExpectedStorageSizeOf(node.cpu_list());
   }
   return size;
 }
@@ -2258,23 +1918,15 @@ bool PerfReader::NeedsNumberOfStringData(u32 type) const {
 
 bool PerfReader::LocalizeMMapFilenames(
     const std::map<string, string>& filename_map) {
+  CHECK(serializer_.SampleInfoReaderAvailable());
+
   // Search for mmap/mmap2 events for which the filename needs to be updated.
-  for (size_t i = 0; i < events_.size(); ++i) {
-    string filename;
-    size_t size_of_fixed_event_parts;
-    event_t* event = events_[i].get();
-    if (event->header.type == PERF_RECORD_MMAP) {
-      filename = string(event->mmap.filename);
-      size_of_fixed_event_parts =
-          sizeof(event->mmap) - sizeof(event->mmap.filename);
-    } else if (event->header.type == PERF_RECORD_MMAP2) {
-      filename = string(event->mmap2.filename);
-      size_of_fixed_event_parts =
-          sizeof(event->mmap2) - sizeof(event->mmap2.filename);
-    } else {
+  for (PerfEvent& event : *proto_->mutable_events()) {
+    if (event.header().type() != PERF_RECORD_MMAP &&
+        event.header().type() != PERF_RECORD_MMAP2) {
       continue;
     }
-
+    const string& filename = event.mmap_event().filename();
     const auto it = filename_map.find(filename);
     if (it == filename_map.end())  // not found
       continue;
@@ -2282,51 +1934,23 @@ bool PerfReader::LocalizeMMapFilenames(
     const string& new_filename = it->second;
     size_t old_len = GetUint64AlignedStringLength(filename);
     size_t new_len = GetUint64AlignedStringLength(new_filename);
-    size_t old_offset = GetPerfSampleDataOffset(*event);
-    size_t sample_size = event->header.size - old_offset;
+    size_t new_size = event.header().size() - old_len + new_len;
 
-    int size_change = new_len - old_len;
-    size_t new_size = event->header.size + size_change;
-    size_t new_offset = old_offset + size_change;
-
-    if (size_change > 0) {
-      // Allocate memory for a new event.
-      event_t* old_event = event;
-      malloced_unique_ptr<event_t> new_event(CallocMemoryForEvent(new_size));
-
-      // Copy over everything except filename and sample info.
-      memcpy(new_event.get(), old_event, size_of_fixed_event_parts);
-
-      // Copy over the sample info to the correct location.
-      char* old_addr = reinterpret_cast<char*>(old_event);
-      char* new_addr = reinterpret_cast<char*>(new_event.get());
-      memcpy(new_addr + new_offset, old_addr + old_offset, sample_size);
-
-      events_[i] = std::move(new_event);
-      event = events_[i].get();
-    } else if (size_change < 0) {
-      // Move the perf sample data to its new location.
-      // Since source and dest could overlap, use memmove instead of memcpy.
-      char* start_addr = reinterpret_cast<char*>(event);
-      memmove(start_addr + new_offset, start_addr + old_offset, sample_size);
-    }
-
-    // Copy over the new filename and fix the size of the event.
-    char *event_filename = nullptr;
-    if (event->header.type == PERF_RECORD_MMAP) {
-      event_filename = event->mmap.filename;
-    } else if (event->header.type == PERF_RECORD_MMAP2) {
-      event_filename = event->mmap2.filename;
-    } else {
-      LOG(FATAL) << "Unexpected event type";  // Impossible
-    }
-    CHECK_GT(snprintf(event_filename, new_filename.size() + 1, "%s",
-                      new_filename.c_str()),
-             0);
-    event->header.size = new_size;
+    event.mutable_mmap_event()->set_filename(new_filename);
+    event.mutable_header()->set_size(new_size);
   }
 
   return true;
+}
+
+void PerfReader::AddPerfFileAttr(const PerfFileAttr& attr) {
+  serializer_.SerializePerfFileAttr(attr, proto_->add_file_attrs());
+
+  // Generate a new SampleInfoReader with the new attr.
+  serializer_.CreateSampleInfoReader(attr, is_cross_endian_);
+  if (!attr.ids.empty()) {
+    file_attrs_seen_.insert(attr.ids[0]);
+  }
 }
 
 }  // namespace quipper

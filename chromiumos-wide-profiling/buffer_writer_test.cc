@@ -6,8 +6,8 @@
 
 #include <vector>
 
-#include "chromiumos-wide-profiling/buffer_writer.h"
-#include "chromiumos-wide-profiling/compat/test.h"
+#include "buffer_writer.h"
+#include "compat/test.h"
 
 namespace quipper {
 
@@ -270,8 +270,3 @@ TEST(BufferWriterTest, NoWritingStringOutOfBounds) {
 }
 
 }  // namespace quipper
-
-int main(int argc, char* argv[]) {
-  ::testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
-}

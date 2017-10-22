@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 syntax = "proto2";
+option cc_enable_arenas = true;
 
 package quipper;
 
@@ -182,7 +183,7 @@ message PerfDataProto {
 
   // This message contains information about a perf sample itself, as opposed to
   // a perf event captured by a sample.
-  // Next tag: 6
+  // Next tag: 7
   message SampleInfo {
     // Process ID / thread ID from which this sample was taken.
     optional uint32 pid = 1;
@@ -198,6 +199,9 @@ message PerfDataProto {
 
     // The CPU on which this sample was taken.
     optional uint32 cpu = 5;
+
+    // The stream id of the sample.
+    optional uint64 stream_id = 6;
   }
 
   // Next tag: 7
@@ -264,6 +268,23 @@ message PerfDataProto {
   }
 
   // Next tag: 4
+  message ReadInfo {
+    optional uint64 time_enabled = 1;
+
+    optional uint64 time_running = 2;
+
+    message ReadValue {
+      optional uint64 value = 1;
+      optional uint64 id = 2;
+    }
+
+    // Based on the value of |PerfEventAttr::read_format & PERF_FORMAT_GROUP|,
+    // the read info could contain one or multiple read values and IDs. If the
+    // format is non-grouped, the repeated field will have only one entry.
+    repeated ReadValue read_value = 3;
+  }
+
+  // Next tag: 4
   message BranchStackEntry {
     // Branch source address.
     optional uint64 from_ip = 1;
@@ -275,7 +296,7 @@ message PerfDataProto {
     optional bool mispredicted = 3;
   }
 
-  // Next tag: 13
+  // Next tag: 19
   message SampleEvent {
     // Instruction pointer.
     optional uint64 ip = 1;
@@ -307,11 +328,28 @@ message PerfDataProto {
     // The raw size of the event in bytes.
     optional uint32 raw_size = 10;
 
+    // The read field.
+    optional ReadInfo read_info = 18;
+
     // Sample callchain info.
     repeated uint64 callchain = 11;
 
     // Branch stack info.
     repeated BranchStackEntry branch_stack = 12;
+
+    // These are not yet implemented, but are listed as placeholders.
+    //
+    // optional RegsUser regs_user = 13;
+    // optional StackUser stack_user = 14;
+
+    // Sample weight for special events.
+    optional uint64 weight = 15;
+
+    // Sample data source flags.
+    optional uint64 data_src = 16;
+
+    // Sample transaction flags for special events.
+    optional uint64 transaction = 17;
   }
 
   // ForkEvent is used for both FORK and EXIT events, which have the same data
@@ -399,17 +437,25 @@ message PerfDataProto {
     optional uint32 size = 3;
   }
 
-  // Next tag: 9
+  // Next tag: 11
   message PerfEvent {
     optional EventHeader header = 1;
-
-    optional MMapEvent mmap_event = 2;
-    optional SampleEvent sample_event = 3;
-    optional CommEvent comm_event = 4;
-    optional ForkEvent fork_event = 5;
-    optional LostEvent lost_event = 6;
-    optional ThrottleEvent throttle_event = 7;
-    optional ReadEvent read_event = 8;
+    oneof event_type {
+      MMapEvent mmap_event = 2;
+      SampleEvent sample_event = 3;
+      CommEvent comm_event = 4;
+      // FORK and EXIT events are structurally identical. They only differ by
+      // the event type. But using two distinct fields allows us to
+      // differentiate between them without having to check the event type under
+      // |header|.
+      ForkEvent fork_event = 5;
+      ForkEvent exit_event = 9;
+      LostEvent lost_event = 6;
+      ThrottleEvent throttle_event = 7;
+      ReadEvent read_event = 8;
+    }
+    // Time after boot in nanoseconds corresponding to the event.
+    optional uint64 timestamp = 10;
   }
 
   // Next tag: 8

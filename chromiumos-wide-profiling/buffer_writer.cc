@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "chromiumos-wide-profiling/buffer_writer.h"
+#include "buffer_writer.h"
 
 #include <string.h>
 
@@ -32,6 +32,10 @@ bool BufferWriter::WriteString(const string& str, const size_t size) {
   memset(buffer_ + offset_, 0, size - write_size);
   offset_ += size - write_size;
   return true;
+}
+
+bool BufferWriter::CanWriteSize(size_t data_size) {
+  return Tell() + data_size <= size();
 }
 
 }  // namespace quipper

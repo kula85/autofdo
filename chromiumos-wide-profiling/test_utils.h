@@ -11,8 +11,10 @@
 #include <string>
 #include <vector>
 
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/perf_parser.h"
+#include "compat/string.h"
+#include "compat/test.h"
+#include "file_utils.h"
+#include "perf_parser.h"
 
 namespace quipper {
 
@@ -35,6 +37,23 @@ int64_t GetFileSize(const string& filename);
 // Returns true if the contents of the two files are the same, false otherwise.
 bool CompareFileContents(const string& filename1, const string& filename2);
 
+template <typename T>
+void CompareTextProtoFiles(const string& filename1, const string& filename2) {
+  std::vector<char> file1_contents;
+  std::vector<char> file2_contents;
+  ASSERT_TRUE(FileToBuffer(filename1, &file1_contents));
+  ASSERT_TRUE(FileToBuffer(filename2, &file2_contents));
+
+  ArrayInputStream arr1(file1_contents.data(), file1_contents.size());
+  ArrayInputStream arr2(file2_contents.data(), file2_contents.size());
+
+  T proto1, proto2;
+  ASSERT_TRUE(TextFormat::Parse(&arr1, &proto1));
+  ASSERT_TRUE(TextFormat::Parse(&arr2, &proto2));
+
+  EXPECT_TRUE(EqualsProto(proto1, proto2));
+}
+
 // Given a perf data file, get the list of build ids and create a map from
 // filenames to build ids.
 bool GetPerfBuildIDMap(const string& filename,
@@ -46,7 +65,22 @@ bool CheckPerfDataAgainstBaseline(const string& filename);
 bool ComparePerfBuildIDLists(const string& file1, const string& file2);
 
 // Returns options suitable for correctness tests.
-PerfParser::Options GetTestOptions();
+PerfParserOptions GetTestOptions();
+
+template <typename T>
+bool EqualsProto(T actual, T expected) {
+  MessageDifferencer differencer;
+  differencer.set_message_field_comparison(MessageDifferencer::EQUAL);
+  return differencer.Compare(expected, actual);
+}
+
+template <typename T>
+bool PartiallyEqualsProto(T actual, T expected) {
+  MessageDifferencer differencer;
+  differencer.set_message_field_comparison(MessageDifferencer::EQUAL);
+  differencer.set_scope(MessageDifferencer::PARTIAL);
+  return differencer.Compare(expected, actual);
+}
 
 }  // namespace quipper
 

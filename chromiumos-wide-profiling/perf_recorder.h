@@ -10,19 +10,35 @@
 
 #include "base/macros.h"
 
-#include "chromiumos-wide-profiling/compat/proto.h"
-#include "chromiumos-wide-profiling/compat/string.h"
-#include "chromiumos-wide-profiling/perf_reader.h"
+#include "compat/string.h"
+#include "perf_reader.h"
 
 namespace quipper {
 
 class PerfRecorder {
  public:
-  PerfRecorder() {}
-  bool RecordAndConvertToProtobuf(const std::vector<string>& perf_args,
-                                  const int time,
-                                  quipper::PerfDataProto* perf_data);
+  PerfRecorder();
+
+  // Mostly for testing.
+  // Security critical: No user-provided strings should be used!
+  explicit PerfRecorder(const std::vector<string>& perf_binary_command);
+
+  // Runs the perf command specified in |perf_args| for |time_sec| seconds. The
+  // output is returned as a serialized protobuf in |output_string|. The
+  // protobuf format depends on the provided perf command.
+  bool RunCommandAndGetSerializedOutput(const std::vector<string>& perf_args,
+                                        const double time_sec,
+                                        string* output_string);
+
+  // The command prefix for running perf. e.g., "perf", or "/usr/bin/perf",
+  // or perhaps {"sudo", "/usr/bin/perf"}.
+  const std::vector<string>& perf_binary_command() const {
+    return perf_binary_command_;
+  }
+
  private:
+  const std::vector<string> perf_binary_command_;
+
   DISALLOW_COPY_AND_ASSIGN(PerfRecorder);
 };
 

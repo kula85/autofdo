@@ -2,23 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "chromiumos-wide-profiling/scoped_temp_path.h"
+#include "scoped_temp_path.h"
 
 #include <errno.h>
 #include <ftw.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
-#include <cstdio>
-#include <cstdlib>
+#include <vector>
 
 #include "base/logging.h"
 
-// Temporary paths follow this format, with the X's replaced by letters or
-// digits. This cannot be defined as a const variable because mkstemp() and
-// mkdtemp() requires an initialized but variable string as an argument.
-#define TEMP_PATH_STRING    "/tmp/quipper.XXXXXX"
-
 namespace {
+
+// Temporary paths use this prefix by default.
+const char kTempPathTemplatePrefix[] = "/tmp/quipper.";
 
 // Maximum number of directories that nftw() will hold open simultaneously.
 const int kNumOpenFds = 4;
@@ -33,25 +32,39 @@ int FileDeletionCallback(const char* path,
   return 0;
 }
 
+// Make a mutable copy (mkstemp modifies its argument), and append "XXXXXX".
+// A vector<char> is used because string does not have an API for mutable
+// direct access to the char data. That is, string::data() returns
+// (const char *), and there is no non-const overload. (This appears to be an
+// oversight of the standard since C++11.)
+std::vector<char> MakeTempfileTemplate(string path_template) {
+  path_template += "XXXXXX";
+  path_template.push_back('\0');
+  return std::vector<char>(path_template.begin(), path_template.end());
+}
+
 }  // namespace
 
 namespace quipper {
 
-ScopedTempFile::ScopedTempFile() {
-  char filename[] = TEMP_PATH_STRING;
-  int fd = mkstemp(filename);
+ScopedTempFile::ScopedTempFile() : ScopedTempFile(kTempPathTemplatePrefix) {}
+
+ScopedTempFile::ScopedTempFile(const string prefix) {
+  std::vector<char> filename = MakeTempfileTemplate(prefix);
+  int fd = mkstemp(filename.data());
   if (fd == -1)
     return;
   close(fd);
-  path_ = filename;
+  path_ = string(filename.data());
 }
 
-ScopedTempDir::ScopedTempDir() {
-  char dirname[] = TEMP_PATH_STRING;
-  const char* name = mkdtemp(dirname);
-  if (!name)
+ScopedTempDir::ScopedTempDir() : ScopedTempDir(kTempPathTemplatePrefix) {}
+
+ScopedTempDir::ScopedTempDir(const string prefix) {
+  std::vector<char> dirname = MakeTempfileTemplate(prefix);
+  if (!mkdtemp(dirname.data()))
     return;
-  path_ = string(name) + "/";
+  path_ = string(dirname.data()) + "/";
 }
 
 ScopedTempPath::~ScopedTempPath() {

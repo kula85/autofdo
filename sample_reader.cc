@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "base/logging.h"
+#include "chromiumos-wide-profiling/perf_data.pb.h"
 #include "chromiumos-wide-profiling/perf_parser.h"
 
 namespace {
@@ -199,8 +200,18 @@ bool TextSampleReaderWriter::IsFileExist() const {
 }
 
 bool PerfDataSampleReader::Append(const string &profile_file) {
-  quipper::PerfParser parser;
-  if (!parser.ReadFile(profile_file) || !parser.ParseRawEvents()) {
+  quipper::PerfReader reader;
+  if (!reader.ReadFile(profile_file)) {
+    return false;
+  }
+
+  quipper::PerfParserOptions opts;
+  opts.sort_events_by_time = true;
+  opts.deduce_huge_page_mappings = true;
+  opts.combine_mappings = true;
+
+  quipper::PerfParser parser(&reader, opts);
+  if (!parser.ParseRawEvents()) {
     return false;
   }
 
@@ -210,10 +221,15 @@ bool PerfDataSampleReader::Append(const string &profile_file) {
   // in the profile, then we use focus_binary to match samples. Otherwise,
   // focus_binary_re_ is used to match the binary name with the samples.
   for (const auto &event : parser.parsed_events()) {
-    if (!event.raw_event ||
-        event.raw_event->header.type != PERF_RECORD_SAMPLE) {
+    // if (!event.raw_event ||
+    //     event.raw_event->header.type != PERF_RECORD_SAMPLE) {
+    //   continue;
+    // }
+    if (!event.event_ptr || !event.event_ptr->has_sample_event()) {
       continue;
     }
+
+    std::cout << event.dso_and_offset.dso_name() << std::endl;
     if (MatchBinary(event.dso_and_offset.dso_name(), focus_binary)) {
       address_count_map_[event.dso_and_offset.offset()]++;
     }

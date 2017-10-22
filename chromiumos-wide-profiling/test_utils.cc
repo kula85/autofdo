@@ -2,24 +2,25 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "chromiumos-wide-profiling/test_utils.h"
+#include "test_utils.h"
 
 #include <string.h>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
 #include "base/logging.h"
 
-#include "chromiumos-wide-profiling/compat/proto.h"
-#include "chromiumos-wide-profiling/perf_serializer.h"
-#include "chromiumos-wide-profiling/run_command.h"
-#include "chromiumos-wide-profiling/utils.h"
+#include "compat/proto.h"
+#include "file_reader.h"
+#include "file_utils.h"
+#include "perf_protobuf_io.h"
+#include "run_command.h"
+#include "string_utils.h"
 
 using quipper::PerfDataProto;
-using quipper::PerfSerializer;
+using quipper::SplitString;
 using quipper::TextFormat;
 
 namespace {
@@ -29,6 +30,9 @@ const char kNewLineDelimiter = '\n';
 
 // Extension of protobuf files in text format.
 const char kProtobufTextExtension[] = ".pb_text";
+
+// Extension of protobuf files in serialized format.
+const char kProtobufDataExtension[] = ".pb_data";
 
 // Extension of build ID lists.
 const char kBuildIDListExtension[] = ".buildids";
@@ -48,16 +52,6 @@ enum {
   NUM_PERF_REPORT_FIELDS,
 };
 
-// Splits a character array by |delimiter| into a vector of strings tokens.
-void SplitString(const string& str,
-                 char delimiter,
-                 std::vector<string>* tokens) {
-  std::stringstream ss(str);
-  std::string token;
-  while (std::getline(ss, token, delimiter))
-    tokens->push_back(token);
-}
-
 // Split a char buffer into separate lines.
 void SeparateLines(const std::vector<char>& bytes, std::vector<string>* lines) {
   if (!bytes.empty())
@@ -66,29 +60,33 @@ void SeparateLines(const std::vector<char>& bytes, std::vector<string>* lines) {
 
 bool ReadExistingProtobufText(const string& filename, string* output_string) {
   std::vector<char> output_buffer;
-  if (!quipper::FileToBuffer(filename + kProtobufTextExtension,
-                               &output_buffer)) {
-    LOG(ERROR) << "Could not open file " << filename + kProtobufTextExtension;
+  if (!quipper::FileToBuffer(filename, &output_buffer)) {
+    LOG(ERROR) << "Could not open file " << filename;
     return false;
   }
   output_string->assign(&output_buffer[0], output_buffer.size());
   return true;
 }
 
-// Given a perf data file, return its protobuf representation (given by
-// PerfSerializer) as a text string.
-bool GetProtobufTextFormat(const string& filename, string* output_string) {
+// Given a perf data file, return its protobuf representation as a text string
+// and/or a serialized data stream.
+bool PerfDataToProtoRepresentation(const string& filename,
+                                   string* output_text,
+                                   string* output_data) {
   PerfDataProto perf_data_proto;
-  PerfSerializer serializer;
-  if (!serializer.SerializeFromFile(filename, &perf_data_proto)) {
+  if (!SerializeFromFile(filename, &perf_data_proto)) {
     return false;
   }
   // Reset the timestamp field since it causes reproducability issues when
   // testing.
   perf_data_proto.set_timestamp_sec(0);
-  if (!TextFormat::PrintToString(perf_data_proto, output_string)) {
+
+  if (output_text &&
+      !TextFormat::PrintToString(perf_data_proto, output_text)) {
     return false;
   }
+  if (output_data && !perf_data_proto.SerializeToString(output_data))
+    return false;
 
   return true;
 }
@@ -117,8 +115,6 @@ const char* kSupportedMetadata[] = {
   "node1 cpu list",       // NUMA topology.
   NULL,
 };
-
-#ifndef QUIPPER_EXTERNAL_TEST_PATHS
 string GetTestInputFilePath(const string& filename) {
   return "testdata/" + filename;
 }
@@ -126,15 +122,12 @@ string GetTestInputFilePath(const string& filename) {
 string GetPerfPath() {
   return "/usr/bin/perf";
 }
-#endif  // !QUIPPER_EXTERNAL_TEST_PATHS
 
 int64_t GetFileSize(const string& filename) {
-  FILE* fp = fopen(filename.c_str(), "rb");
-  if (!fp)
+  FileReader reader(filename);
+  if (!reader.IsOpen())
     return -1;
-  int64_t file_size = GetFileSizeFromHandle(fp);
-  fclose(fp);
-  return file_size;
+  return reader.size();
 }
 
 bool CompareFileContents(const string& filename1, const string& filename2) {
@@ -156,8 +149,8 @@ bool GetPerfBuildIDMap(const string& filename,
   LOG(INFO) << filename + kBuildIDListExtension;
   if (!quipper::FileToBuffer(filename + kBuildIDListExtension, &buildid_list)) {
     buildid_list.clear();
-    if (!RunCommand({GetPerfPath(), "buildid-list", "--force", "-i", filename},
-                    &buildid_list)) {
+    if (RunCommand({GetPerfPath(), "buildid-list", "--force", "-i", filename},
+                   &buildid_list) != 0) {
       LOG(ERROR) << "Failed to run perf buildid-list";
       return false;
     }
@@ -185,31 +178,48 @@ bool GetPerfBuildIDMap(const string& filename,
 namespace {
 // Running tests while this is true will blindly make tests pass! So, remember
 // to look at the diffs and explain them before submitting.
-// TODO(dhsharp): replace this with a command-line flag.
 static const bool kWriteNewGoldenFiles = false;
+
+// This flag enables comparisons of protobufs in serialized format as a faster
+// alternative to comparing their human-readable text representations. Set this
+// flag to false to compare text representations instead. It's also useful for
+// diffing against the old golden files when writing new golden files.
+const bool UseProtobufDataFormat = true;
 }  // namespace
 
 bool CheckPerfDataAgainstBaseline(const string& filename) {
-  string protobuf_text;
-  if (!GetProtobufTextFormat(filename, &protobuf_text)) {
-    return false;
+  string extension =
+      UseProtobufDataFormat ? kProtobufDataExtension : kProtobufTextExtension;
+  string protobuf_representation;
+  if (UseProtobufDataFormat) {
+    if (!PerfDataToProtoRepresentation(filename, nullptr,
+                                       &protobuf_representation)) {
+      return false;
+    }
+  } else {
+    if (!PerfDataToProtoRepresentation(filename, &protobuf_representation,
+                                       nullptr)) {
+      return false;
+    }
   }
-  string existing_input_file = GetTestInputFilePath(basename(filename.c_str()));
+
+  string existing_input_file =
+      GetTestInputFilePath(basename(filename.c_str())) + extension;
   string baseline;
   if (!ReadExistingProtobufText(existing_input_file , &baseline)) {
     return false;
   }
-  bool matches_baseline = (baseline == protobuf_text);
+  bool matches_baseline = (baseline == protobuf_representation);
   if (kWriteNewGoldenFiles) {
-    string existing_input_pb_text =
-        existing_input_file + kProtobufTextExtension + ".new";
+    string existing_input_pb_text = existing_input_file + ".new";
     if (matches_baseline) {
       LOG(INFO) << "NOT writing identical golden file! "
                 << existing_input_pb_text;
       return true;
     }
     LOG(INFO) << "Writing new golden file! " << existing_input_pb_text;
-    BufferToFile(existing_input_pb_text, protobuf_text);
+    BufferToFile(existing_input_pb_text, protobuf_representation);
+
     return true;
   }
   return matches_baseline;
@@ -227,8 +237,8 @@ bool ComparePerfBuildIDLists(const string& file1, const string& file2) {
   return output1 == output2;
 }
 
-PerfParser::Options GetTestOptions() {
-  PerfParser::Options options;
+PerfParserOptions GetTestOptions() {
+  PerfParserOptions options;
   options.sample_mapping_percentage_threshold = 100.0f;
   return options;
 }
