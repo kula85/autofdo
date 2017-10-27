@@ -83,8 +83,7 @@ bool ProfileCreator::ComputeProfile(SymbolMap *symbol_map,
   std::set<uint64> sampled_addrs = sample_reader_->GetSampledAddresses();
   std::map<uint64, uint64> sampled_functions =
       symbol_map->GetSampledSymbolStartAddressSizeMap(sampled_addrs);
-  *addr2line =
-      Addr2line::CreateWithSampledFunctions(binary_, &sampled_functions);
+  *addr2line = new LLVMAddr2line(binary_);
 
   if (*addr2line == nullptr) {
     LOG(ERROR) << "Error reading binary " << binary_;

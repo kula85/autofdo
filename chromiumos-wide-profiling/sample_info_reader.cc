@@ -32,7 +32,7 @@ bool IsSupportedEventType(uint32_t type) {
   case PERF_RECORD_MAX:
     return false;
   default:
-    LOG(FATAL) << "Unknown event type " << type;
+    //LOG(FATAL) << "Unknown event type " << type;
     return false;
   }
 }

@@ -206,6 +206,7 @@ bool PerfDataSampleReader::Append(const string &profile_file) {
   }
 
   quipper::PerfParserOptions opts;
+  opts.do_remap = true;
   opts.sort_events_by_time = true;
   opts.deduce_huge_page_mappings = true;
   opts.combine_mappings = true;

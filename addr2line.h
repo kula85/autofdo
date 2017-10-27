@@ -23,6 +23,12 @@
 #include "base/common.h"
 #include "source_info.h"
 
+namespace llvm {
+namespace symbolize {
+class LLVMSymbolizer;
+}
+}
+
 namespace autofdo {
 class Addr2line {
  public:
@@ -48,6 +54,18 @@ class Addr2line {
 
  private:
   DISALLOW_COPY_AND_ASSIGN(Addr2line);
+};
+
+class LLVMAddr2line : public Addr2line {
+ public:
+  explicit LLVMAddr2line(const string &binary_name);
+  virtual ~LLVMAddr2line();
+  bool Prepare() override;
+  void GetInlineStack(uint64 address, SourceStack *stack) const override;
+
+ private:
+  llvm::symbolize::LLVMSymbolizer *Symbolizer;
+  DISALLOW_COPY_AND_ASSIGN(LLVMAddr2line);
 };
 
 class AddressQuery;

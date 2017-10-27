@@ -1,9 +1,9 @@
 ## Process this file with automake to produce Makefile.in
 
 ACLOCAL_AMFLAGS = -I m4
-AM_CPPFLAGS = -I$(top_srcdir) -I$(top_srcdir)/glog/src -I$(top_srcdir)/chromiumos-wide-profiling -I$(top_srcdir)/chromiumos-wide-profiling/compat/ext -I/home/qe/Install/generic/protobuf/include -I/home/qe/Install/generic/llvm5/include
+AM_CPPFLAGS = $(LLVM_CXXFLAGS) -I$(top_srcdir) -I$(top_srcdir)/glog/src -I$(top_srcdir)/chromiumos-wide-profiling -I$(top_srcdir)/chromiumos-wide-profiling/compat/ext -I/home/qe/Install/generic/protobuf/include
 AM_CXXFLAGS = -g -std=gnu++11
-AM_LDFLAGS = $(LLVM_LDFLAGS) -L/home/qe/Install/generic/googletest/lib -lgtest -L/home/qe/Install/generic/protobuf/lib -lprotobuf -pthread -lpthread -lelf
+AM_LDFLAGS = $(LLVM_LDFLAGS) -L/home/qe/Install/generic/googletest/lib64 -lgtest -L/home/qe/Install/generic/protobuf/lib -lprotobuf -pthread -lpthread -lelf
 
 COMMON_PROFILE_CREATOR_FILES = addr2line.cc gcov.cc instruction_map.cc \
                                module_grouper.cc profile_creator.cc \
@@ -50,6 +50,7 @@ noinst_LIBRARIES = libquipper.a
 
 $(top_srcdir)/chromiumos-wide-profiling/libquipper.a:
 	echo "[MAKE]    Building protobuf"
+	$(MAKE) -C $(top_srcdir)/chromiumos-wide-profiling -f Makefile.external clean
 	$(MAKE) -C $(top_srcdir)/chromiumos-wide-profiling -f Makefile.external
 
 libquipper.a: $(top_srcdir)/chromiumos-wide-profiling/libquipper.a
