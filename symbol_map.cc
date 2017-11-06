@@ -656,7 +656,7 @@ std::map<uint64, uint64> SymbolMap::GetSampledSymbolStartAddressSizeMap(
 typedef llvm::sampleprof::SourceStack SourceStack2;
 typedef llvm::sampleprof::SourceInfo SourceInfo2;
 
-static const SourceStack2 GetInlineStack(CallFrame CF,
+static SourceStack2 GetInlineStack(CallFrame CF,
                                          const Addr2line *addr2line,
                                          const string &file_base_name,
                                          const uint64 base_addr) {
@@ -698,21 +698,16 @@ void SymbolMap::ComputeCallChain(const Addr2line *addr2line,
     }
 
     for (const auto &S : it.second) {
-      const SourceStack2 &SS = GetInlineStack(S, addr2line, file_base_name, base_addr_);
+      const SourceStack2 SS = GetInlineStack(S, addr2line, file_base_name, base_addr_);
       if (SS.size() > 1) {
         SourceStack2 TSS = source_stack;
         TSS.insert(TSS.end(), SS.begin()+1, SS.end());
-        call_chain_count_map_[TSS].push_back(SS[0]);
+        call_chain_count_map_[TSS][SS[0]]++;
       } else if (SS.size() == 1) {
-        call_chain_count_map_[source_stack].push_back(SS[0]);
+        call_chain_count_map_[source_stack][SS[0]]++;
       } else
         assert(0);
     }
-  }
-
-  for (auto &it : call_chain_count_map_) {
-    std::set<SourceInfo2> T(it.second.begin(), it.second.end());
-    it.second.assign(T.begin(), T.end());
   }
 }
 
