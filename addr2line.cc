@@ -279,6 +279,8 @@ void Google3Addr2line::GetInlineStack(uint64 address,
 
 LLVMAddr2line::~LLVMAddr2line() {
   delete Symbolizer;
+  for (auto S : Cache)
+    delete[] S;
 }
 
 LLVMAddr2line::LLVMAddr2line(const std::string &binary_name) : Addr2line(binary_name) {
@@ -290,13 +292,25 @@ bool LLVMAddr2line::Prepare() {
   return true;
 }
 
-static void ConvertToStack(const DIInliningInfo &DII, SourceStack *stack) {
+static void ConvertToStack(const DIInliningInfo &DII, SourceStack *stack, const std::vector<char *> &Cache1) {
+  std::vector<char *> &Cache = const_cast<std::vector<char *>&>(Cache1);
   for (unsigned i = 0; i < DII.getNumberOfFrames(); ++i) {
     const DILineInfo LI = DII.getFrame(i);
 
-    stack->push_back(SourceInfo(LI.FunctionName.c_str(),
-                                LI.FileName.c_str(),
-                                LI.FileName.c_str(),
+    char *FunctionName = new char[LI.FunctionName.size()+1]();
+    char *FileName = new char[LI.FileName.size()+1]();
+    Cache.push_back(FunctionName);
+    Cache.push_back(FileName);
+
+    LI.FunctionName.copy(FunctionName, LI.FunctionName.size());
+    FunctionName[LI.FunctionName.size()] = '\0';
+
+    LI.FileName.copy(FileName, LI.FileName.size());
+    FileName[LI.FileName.size()] = '\0';
+
+    stack->push_back(SourceInfo(FunctionName,
+                                FileName,
+                                FileName,
                                 LI.StartLine,
                                 LI.Line,
                                 LI.Discriminator));
@@ -306,7 +320,7 @@ static void ConvertToStack(const DIInliningInfo &DII, SourceStack *stack) {
 void LLVMAddr2line::GetInlineStack(uint64 address, SourceStack *stack) const {
   auto ResOrErr = Symbolizer->symbolizeInlinedCode(binary_name_, address);
   assert (!error(ResOrErr));
-  ConvertToStack(ResOrErr.get(), stack);
+  ConvertToStack(ResOrErr.get(), stack, Cache);
 }
 
 }  // namespace autofdo

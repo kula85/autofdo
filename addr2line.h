@@ -65,6 +65,7 @@ class LLVMAddr2line : public Addr2line {
 
  private:
   llvm::symbolize::LLVMSymbolizer *Symbolizer;
+  std::vector<char *> Cache;
   DISALLOW_COPY_AND_ASSIGN(LLVMAddr2line);
 };
 

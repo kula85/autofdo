@@ -669,9 +669,9 @@ static SourceStack2 GetInlineStack(CallFrame CF,
     addr2line->GetInlineStack(base_addr + Offset, &iss);
 
     for (auto &S : iss) {
-      const string func_name = S.func_name ? S.func_name : "null";
-      const string dir_name = S.dir_name ? S.dir_name : "null";
-      const string file_name = S.file_name ? S.file_name : "null";
+      const string func_name(S.func_name ? S.func_name : "null");
+      const string dir_name(S.dir_name ? S.dir_name : "null");
+      const string file_name(S.file_name ? S.file_name : "null");
       source_stack.push_back(SourceInfo2(func_name, dir_name, file_name,
                                          S.start_line, S.line, S.discriminator));
     }
