@@ -37,6 +37,18 @@ struct SourceInfo {
         file_name(file_name),
         start_line(start_line),
         line(line),
+        column(0),
+        discriminator(discriminator) {}
+
+  SourceInfo(const char *func_name, const char *dir_name,
+             const char *file_name, uint32 start_line, uint32 line, uint32 column,
+             uint32 discriminator)
+      : func_name(func_name),
+        dir_name(dir_name),
+        file_name(file_name),
+        start_line(start_line),
+        line(line),
+        column(column),
         discriminator(discriminator) {}
 
   bool operator<(const SourceInfo &p) const;
@@ -75,6 +87,7 @@ struct SourceInfo {
   const char *file_name;
   uint32 start_line;
   uint32 line;
+  uint32 column;
   uint32 discriminator;
 };
 

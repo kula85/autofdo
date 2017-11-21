@@ -258,12 +258,14 @@ bool PerfDataSampleReader::Append(const string &profile_file) {
       }
     }
 
-    CallChain CC;
-    for (unsigned i = 0; i < event.callchain.size(); i++)
-      CC.push_back(std::make_pair(event.callchain[i].dso_name(),
-                                  event.callchain[i].offset()));
-    callchain_count_map_[CC].insert(std::make_pair(event.dso_and_offset.dso_name(),
-                                                   event.dso_and_offset.offset()));
+    if (MatchBinary(event.dso_and_offset.dso_name(), focus_binary)) {
+      CallChain CC;
+      for (unsigned i = 0; i < event.callchain.size(); i++)
+        CC.push_back(std::make_pair(event.callchain[i].dso_name(),
+                                    event.callchain[i].offset()));
+      callchain_count_map_[CC].insert(std::make_pair(event.dso_and_offset.dso_name(),
+                                                    event.dso_and_offset.offset()));
+    }
   }
   return true;
 }

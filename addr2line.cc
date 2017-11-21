@@ -294,8 +294,10 @@ bool LLVMAddr2line::Prepare() {
 
 static void ConvertToStack(const DIInliningInfo &DII, SourceStack *stack, const std::vector<char *> &Cache1) {
   std::vector<char *> &Cache = const_cast<std::vector<char *>&>(Cache1);
+  //std::cout << "----------\n";
   for (unsigned i = 0; i < DII.getNumberOfFrames(); ++i) {
     const DILineInfo LI = DII.getFrame(i);
+    //std::cout << LI.FunctionName << "\n";
 
     char *FunctionName = new char[LI.FunctionName.size()+1]();
     char *FileName = new char[LI.FileName.size()+1]();
@@ -313,8 +315,10 @@ static void ConvertToStack(const DIInliningInfo &DII, SourceStack *stack, const 
                                 FileName,
                                 LI.StartLine,
                                 LI.Line,
+                                LI.Column,
                                 LI.Discriminator));
   }
+  //std::cout << "----*******------\n";
 }
 
 void LLVMAddr2line::GetInlineStack(uint64 address, SourceStack *stack) const {

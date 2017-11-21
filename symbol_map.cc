@@ -673,13 +673,18 @@ static SourceStack2 GetInlineStack(CallFrame CF,
       const string dir_name(S.dir_name ? S.dir_name : "null");
       const string file_name(S.file_name ? S.file_name : "null");
       source_stack.push_back(SourceInfo2(func_name, dir_name, file_name,
-                                         S.start_line, S.line, S.discriminator));
+                                         S.start_line, S.line, S.column,
+                                         S.discriminator));
     }
   } else { // other binary
     // TODO: correct this using addr2line for shared library also.
-    const char *DN = DSOName.c_str();
+    //const char *DN = DSOName.c_str();
+    char *DN = new char[DSOName.size()+1]();
+    DSOName.copy(DN, DSOName.size());
+    DN[DSOName.size()] = '\0';
+
     const uint32 max32 = numeric_limits<uint32_t>::max();
-    source_stack.push_back(SourceInfo2(DN, DN, DN, max32, max32, max32));
+    source_stack.push_back(SourceInfo2(DN, DN, DN, max32, max32, max32, max32));
   }
 
   return source_stack;
@@ -701,7 +706,7 @@ void SymbolMap::ComputeCallChain(const Addr2line *addr2line,
       const SourceStack2 SS = GetInlineStack(S, addr2line, file_base_name, base_addr_);
       if (SS.size() > 1) {
         SourceStack2 TSS = source_stack;
-        TSS.insert(TSS.end(), SS.begin()+1, SS.end());
+        TSS.insert(TSS.begin(), SS.begin()+1, SS.end());
         call_chain_count_map_[TSS][SS[0]]++;
       } else if (SS.size() == 1) {
         call_chain_count_map_[source_stack][SS[0]]++;
